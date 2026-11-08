@@ -6,6 +6,7 @@
   "client": [
   ],
   "mixins": [
+    "Rapier3DMixin",
     "RapierPhysicsPipelineProviderMixin"
   ],
   "injectors": {

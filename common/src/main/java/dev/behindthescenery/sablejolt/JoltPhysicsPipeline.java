@@ -114,6 +114,17 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     private final Long2LongOpenHashMap provisionalSections = new Long2LongOpenHashMap();
     private JoltPhysicsScene scene;
     private JoltVoxelColliderBakery colliderBakery;
+    private double gravityX;
+    private double gravityY;
+    private double gravityZ;
+    private double universalDrag;
+    private boolean initialized;
+    private boolean disposed;
+    /**
+     * Solver settings received before the native world exists.
+     */
+    @Nullable
+    private PhysicsConfigData pendingConfig;
 
     public JoltPhysicsPipeline(final ServerLevel level) {
         this.level = level;
@@ -132,11 +143,35 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         return ((int) state.byteRepresentation() & 0xFF) | ((fluidLevel & 0xF) << 8) | (colliderID << 16);
     }
 
-    private JoltPhysicsScene scene() {
-        if (this.scene == null) {
-            throw new IllegalStateException("Physics scene is not initialized");
+    /**
+     * The physics world of this dimension, created when something first needs it:
+     * Sable makes a pipeline per dimension, and a modded server has dozens of
+     * dimensions that never see a sub-level. Each native world costs about 10 MB
+     * plus a native call per substep, for nothing.
+     *
+     * @return the scene, or null before {@link #init} and after {@link #dispose}
+     */
+    @Nullable
+    private JoltPhysicsScene sceneOrCreate() {
+        if (this.scene == null && this.initialized && !this.disposed) {
+            final JoltPhysicsScene created = new JoltPhysicsScene(this.gravityX, this.gravityY, this.gravityZ, this.universalDrag);
+            this.colliderBakery = new JoltVoxelColliderBakery(this.level, created.colliderRegistry);
+            created.attachColliderBakery(this.colliderBakery);
+            if (this.pendingConfig != null) {
+                created.configSolverIterations(this.pendingConfig.solverIterations, this.pendingConfig.pgsIterations);
+                this.pendingConfig = null;
+            }
+            this.scene = created;
         }
         return this.scene;
+    }
+
+    private JoltPhysicsScene scene() {
+        final JoltPhysicsScene current = this.sceneOrCreate();
+        if (current == null) {
+            throw new IllegalStateException("Physics scene is not initialized");
+        }
+        return current;
     }
 
     private JoltVoxelColliderBakery bakery() {
@@ -147,16 +182,16 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     }
 
     /**
-     * Initializes the physics pipeline.
+     * Initializes the physics pipeline. The native world follows with the first
+     * body ({@link #sceneOrCreate}).
      */
     @Override
     public void init(@Nullable final Vector3dc gravity, final double universalDrag) {
-        final double gx = gravity != null ? gravity.x() : 0.0;
-        final double gy = gravity != null ? gravity.y() : -9.81;
-        final double gz = gravity != null ? gravity.z() : 0.0;
-        this.scene = new JoltPhysicsScene(gx, gy, gz, universalDrag);
-        this.colliderBakery = new JoltVoxelColliderBakery(this.level, this.scene.colliderRegistry);
-        this.scene.attachColliderBakery(this.colliderBakery);
+        this.gravityX = gravity != null ? gravity.x() : 0.0;
+        this.gravityY = gravity != null ? gravity.y() : -9.81;
+        this.gravityZ = gravity != null ? gravity.z() : 0.0;
+        this.universalDrag = universalDrag;
+        this.initialized = true;
     }
 
     /**
@@ -164,6 +199,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
      */
     @Override
     public void dispose() {
+        this.disposed = true;
         // The disposed scene stays referenced: Create contraptions and handles
         // of other mods may still call in while the world closes, and every
         // scene operation is a no-op after disposal.
@@ -245,7 +281,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     @Override
     public void add(final ServerSubLevel subLevel, final Pose3dc pose) {
         this.assertBodyValid(subLevel);
-        final JoltPhysicsScene scene = this.scene;
+        final JoltPhysicsScene scene = this.sceneOrCreate();
         if (scene == null) {
             return;
         }
@@ -377,7 +413,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
         if (this.activeContraptions.containsKey(contraption)) {
             throw new IllegalStateException("Contraption " + contraption + " is already present in pipeline");
         }
-        final JoltPhysicsScene scene = this.scene;
+        final JoltPhysicsScene scene = this.sceneOrCreate();
         if (scene == null) {
             return;
         }
@@ -532,7 +568,7 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
      */
     @Override
     public void handleChunkSectionAddition(final LevelChunkSection section, final int x, final int y, final int z, final boolean uploadDataIfGlobal) {
-        if (this.scene == null) {
+        if (this.sceneOrCreate() == null) {
             return;
         }
         this.accelerator.clearCache();
@@ -867,6 +903,8 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
     public void updateConfigFrom(final PhysicsConfigData data) {
         if (this.scene != null) {
             this.scene.configSolverIterations(data.solverIterations, data.pgsIterations);
+        } else {
+            this.pendingConfig = data;
         }
     }
 
@@ -875,11 +913,12 @@ public class JoltPhysicsPipeline implements PhysicsPipeline {
      */
     @Override
     public int getNextRuntimeID() {
-        return this.scene != null ? this.scene.nextRuntimeId() : this.fallbackRuntimeId++;
+        final JoltPhysicsScene current = this.sceneOrCreate();
+        return current != null ? current.nextRuntimeId() : this.fallbackRuntimeId++;
     }
 
     /**
-     * Ids handed out before init (never expected); far from the scene's range.
+     * Ids handed out outside init and dispose (never expected); far from the scene's range.
      */
     private int fallbackRuntimeId = 1 << 30;
 

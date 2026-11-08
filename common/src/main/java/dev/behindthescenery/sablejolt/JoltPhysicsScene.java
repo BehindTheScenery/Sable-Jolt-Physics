@@ -16,6 +16,7 @@ import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
@@ -45,9 +46,20 @@ import java.util.function.IntConsumer;
  * <p>
  * Every sub-level is a dynamic body whose compound shape is built from voxel
  * chunk data, one static compound per 16³ section under a small mutable parent
- * (sections are rebuilt individually when their blocks change); the global
- * world is stored as one static body per chunk section. Kinematic contraptions
+ * (sections are rebuilt individually when their blocks change); its full cubes
+ * are merged into large boxes. The global world is one static body per terrain
+ * region of 1024 x 1024 blocks, made of tiles of sections (see
+ * {@link #TILE_SHIFT}): a surface mesh of the full cubes' exposed faces whose
+ * triangles share every vertex with their neighbours (see
+ * {@link #buildSurfaceMesh}), recessed boxes under it, and boxes for other
+ * blocks; blocks with contact callbacks form a second body per region (see
+ * {@link #LAYER_STATIC_SPECIAL}). Seam ("ghost") contacts are removed by Jolt's
+ * enhanced internal edge removal: the Rapier pipeline gets the same from its
+ * neighborhood states and interior collision test. Kinematic contraptions
  * mounted on a sub-level are part of the sub-level's compound, as in Rapier.
+ * <p>
+ * {@code gradle :common:parity} compares this scene with Sable's own Rapier
+ * natives on a set of scenes (src/jmh, ParityHarness).
  */
 @ApiStatus.Internal
 public final class JoltPhysicsScene {
@@ -63,15 +75,96 @@ public final class JoltPhysicsScene {
      */
     public static final int LAYER_MOVING_REPORT = 3;
     /**
-     * Terrain sections with special blocks (friction, restitution, callbacks).
+     * Terrain blocks with a contact callback: the second static body of each
+     * terrain region. Collides like {@link #LAYER_STATIC}, and every contact
+     * with it reaches the contact listener whatever the moving body's layer.
+     * That body keeps one contact manifold per block pair (no manifold
+     * reduction), so every block gets its own callback, as Rapier's hooks do
+     * per voxel pair (hooks.rs), and a callback can cancel or move its own
+     * contact without touching the neighbouring blocks'.
      */
     public static final int LAYER_STATIC_SPECIAL = 4;
     private static final int NUM_OBJECT_LAYERS = 5;
 
     /**
-     * Below this speed bound (m/s) a body cannot take part in an impact
-     * report: reports need a relative normal speed of 1.25 m/s (the
-     * pipeline's 25 * minMass force threshold), i.e. 0.625 m/s per body.
+     * Penetration Jolt leaves uncorrected: Rapier's {@code normalized_allowed_linear_error}
+     * (lib.rs), so bodies rest as deep in the ground as with Rapier.
+     */
+    private static final float ALLOWED_PENETRATION = 0.0025f;
+    /**
+     * Distance at which contacts are created ahead of touching: Rapier's
+     * {@code normalized_prediction_distance} (lib.rs) instead of Jolt's 2 cm.
+     * Ahead-of-touch contacts with the edge of the next block tilt the contact
+     * normal towards the sliding body (bumps at block seams), and catch only part
+     * of a voxel face that lands at an angle: a rolling block wheel then lands
+     * on the middle of its next face, which stops its fall but not its spin.
+     */
+    private static final float SPECULATIVE_CONTACT_DISTANCE = 0.005f;
+    /**
+     * Fraction of a body's inner radius it must move in a substep before a swept
+     * body casts, and the fraction it may end up inside what it hit.
+     */
+    private static final float LINEAR_CAST_THRESHOLD = 0.2f;
+    private static final float LINEAR_CAST_MAX_PENETRATION = 0.05f;
+
+    /**
+     * Terrain sections are grouped into tiles of 4x4x4 sections, and tiles into
+     * regions of 64x64 sections (all heights): one static body per region. Jolt
+     * removes the contacts with internal edges ("ghost" contacts at the seams
+     * between blocks, which trip sliding bodies) only within one body pair, so
+     * the seams between sections must not be body boundaries. Rapier uses one
+     * collider for the whole world and drops such contacts itself (dispatcher.rs,
+     * is_interior_collision). A region spans 1024 blocks around its origin, so
+     * sub-shape offsets stay within 512 blocks (exact in float) and sub-shape
+     * ids within 30 bits; region boundaries lie at 512 + 1024 * k, away from
+     * spawn.
+     */
+    private static final int TILE_SHIFT = 2;
+    private static final int REGION_SECTION_SHIFT = 6;
+    private static final int REGION_HALF_SECTIONS = 1 << (REGION_SECTION_SHIFT - 1);
+
+    /**
+     * Terrain layers: every block without a contact callback (one region body
+     * with surface meshes, recessed boxes and the boxes of partial blocks), and
+     * blocks with a contact callback (a second region body, see
+     * {@link #LAYER_STATIC_SPECIAL}).
+     */
+    static final int TERRAIN_PLAIN = 0;
+    static final int TERRAIN_SPECIAL = 1;
+
+    /**
+     * Inset of the merged boxes under the surface mesh of plain terrain. The
+     * mesh carries every contact of a body resting or sliding on the terrain;
+     * the boxes only hold bodies pushed deeper than this (and stay out of
+     * speculative contact range of resting bodies).
+     */
+    private static final float TERRAIN_RECESS = 0.02f;
+    /**
+     * Triangles per surface mesh: bigger sections get several meshes, which
+     * keeps the sub-shape ids of a mesh within 17 bits.
+     */
+    private static final int MAX_MESH_TRIANGLES = 4096;
+
+    /**
+     * Terrain sections get their surface mesh only near awake bodies (a mesh
+     * costs about ten times the build time of merged boxes, and depends on its
+     * neighbours): within this many blocks of a body's bounds, stretched along
+     * its velocity by the distance it covers in {@link #MESH_LOOKAHEAD}
+     * seconds. At most {@link #MESH_UPGRADES_PER_FLUSH} sections are meshed per
+     * step, nearest first; sections stay meshed for {@link #MESH_KEEP_STEPS}
+     * substeps after the last body left.
+     */
+    private static final double MESH_MARGIN = 12.0;
+    private static final double MESH_LOOKAHEAD = 0.75;
+    private static final double MESH_MAX_LOOKAHEAD = 96.0;
+    private static final int MESH_UPGRADES_PER_FLUSH = 32;
+    private static final long MESH_KEEP_STEPS = 1200L;
+
+    /**
+     * Upper bound of the speed (m/s) below which a body takes no part in an
+     * impact report: a report needs a relative normal speed of 25 * dt (the
+     * pipeline's 25 * minMass force threshold, 0.625 m/s at 2 substeps), see
+     * {@link #reportSpeed}.
      */
     private static final float REPORT_SPEED = 0.55f;
 
@@ -116,8 +209,6 @@ public final class JoltPhysicsScene {
     private static final float RAPIER_MAX_LINEAR_VELOCITY = 2_000.0f;
     private static final float RAPIER_MAX_ANGULAR_VELOCITY = 400.0f;
 
-    private static final int CPU_COUNT = Runtime.getRuntime().availableProcessors();
-
     // region Shared native resources
 
     /**
@@ -128,9 +219,8 @@ public final class JoltPhysicsScene {
     private static ExecutorService sharedWorkers;
     private static int sharedWorkerCount = 1;
 
-    private static synchronized JobSystem sharedJobSystem(final int configuredThreads) {
+    private static synchronized JobSystem sharedJobSystem(final int threads) {
         if (sharedJobSystem == null) {
-            final int threads = configuredThreads > 0 ? configuredThreads : Math.max(1, CPU_COUNT - 1);
             // Extra barriers so dimensions ticked in parallel by other mods never starve.
             sharedJobSystem = new JobSystemThreadPool(Jolt.cMaxPhysicsJobs, Jolt.cMaxPhysicsBarriers * 2, threads);
         }
@@ -139,7 +229,7 @@ public final class JoltPhysicsScene {
 
     private static synchronized ExecutorService sharedWorkers() {
         if (sharedWorkers == null) {
-            sharedWorkerCount = Math.max(1, CPU_COUNT - 2);
+            sharedWorkerCount = SableJoltConfig.get().workerThreads();
             final AtomicInteger counter = new AtomicInteger();
             sharedWorkers = Executors.newFixedThreadPool(sharedWorkerCount, r -> {
                 final Thread t = new Thread(r, "sable-jolt-worker-" + counter.incrementAndGet());
@@ -218,18 +308,21 @@ public final class JoltPhysicsScene {
     private static final ThreadLocal<BoxKey> BOX_KEY = ThreadLocal.withInitial(BoxKey::new);
 
     private BoxShape sharedBoxShape(final float hx, final float hy, final float hz) {
-        // Fast path: probe with a reusable ThreadLocal key (no allocation on hit;
-        // hits dominate — terrain slabs repeat a handful of sizes). The probe is
-        // never stored: on miss a dedicated immutable copy becomes the map key,
-        // so later set() calls cannot corrupt the stored hash.
+        // Probe with a reusable ThreadLocal key (no allocation on hit; merged
+        // boxes repeat a handful of sizes). The probe is never stored: on miss a
+        // dedicated immutable copy becomes the map key, so later set() calls
+        // cannot corrupt the stored hash. Sections are built on worker threads.
         final BoxKey probe = BOX_KEY.get().set(hx, hy, hz);
-        final BoxShape existing = this.sharedBoxShapes.get(probe);
-        if (existing != null) {
-            return existing;
+        synchronized (this.sharedBoxShapes) {
+            final BoxShape existing = this.sharedBoxShapes.get(probe);
+            if (existing != null) {
+                return existing;
+            }
+            // Same rounding as the per-block boxes (JoltVoxelColliderData#shape).
+            final BoxShape created = newBoxShape(hx, hy, hz, 0.025f);
+            this.sharedBoxShapes.put(new BoxKey(hx, hy, hz), created);
+            return created;
         }
-        final BoxShape created = newBoxShape(hx, hy, hz, 0.02f);
-        final BoxShape raced = this.sharedBoxShapes.putIfAbsent(new BoxKey(hx, hy, hz), created);
-        return raced != null ? raced : created;
     }
 
     /**
@@ -354,6 +447,23 @@ public final class JoltPhysicsScene {
     private static final int HEAVY_BODY_CHILDREN = 2048;
 
     /**
+     * Awake compound leaves in the scene from which the multithreaded job system
+     * is used, however few bodies there are: sixteen moving bodies of 500 leaves
+     * cost as much narrow phase as one huge body.
+     */
+    private static final int PARALLEL_AWAKE_LEAVES = 512;
+
+    /**
+     * Compound leaves from which a sub-level only sweeps (LinearCast) while it is
+     * fast enough to skip a block in one substep. A sweep casts the whole compound
+     * against the world, and Jolt starts it at 0.75 x the smallest leaf radius per
+     * step, so one carpet in a ship means sweeping from about 1 m/s: 16 bodies of
+     * 900 blocks reached 160 ms ticks. Below one block per substep a discrete step
+     * cannot miss a full block.
+     */
+    private static final int SPEED_SWEPT_BODY_CHILDREN = 256;
+
+    /**
      * Jolt buoyancy iterates the body's blocks per substep; above this count the
      * loop is subsampled (with volume compensation) so a 30k-block body costs
      * the same as a 4k-block one.
@@ -390,7 +500,33 @@ public final class JoltPhysicsScene {
     private final ObjectArrayList<SableBody> contraptionList = new ObjectArrayList<>();
     private final ObjectArrayList<SableBody> pendingCreation = new ObjectArrayList<>();
     private final Long2ObjectOpenHashMap<GlobalChunk> globalChunks = new Long2ObjectOpenHashMap<>();
-    private final Int2ObjectOpenHashMap<GlobalChunk> globalChunksByBodyId = new Int2ObjectOpenHashMap<>();
+    /**
+     * Terrain regions by region key, and their bodies (one per terrain layer) by body id.
+     */
+    private final Long2ObjectOpenHashMap<TerrainRegion> terrainRegions = new Long2ObjectOpenHashMap<>();
+    private final Int2ObjectOpenHashMap<RegionLayer> terrainRegionsByBodyId = new Int2ObjectOpenHashMap<>();
+    private final Long2ObjectOpenHashMap<TerrainTile> terrainTiles = new Long2ObjectOpenHashMap<>();
+    /**
+     * Tiles whose compounds must be rebuilt before the next step.
+     */
+    private final ReferenceOpenHashSet<TerrainTile> dirtyTiles = new ReferenceOpenHashSet<>();
+    /**
+     * Terrain sections built with a surface mesh, and the flush count until
+     * which they keep it (see {@link #MESH_MARGIN}).
+     */
+    private final Long2LongOpenHashMap meshedSections = new Long2LongOpenHashMap();
+    private final LongArrayList meshUpgrades = new LongArrayList();
+    private final it.unimi.dsi.fastutil.doubles.DoubleArrayList meshUpgradeDistances = new it.unimi.dsi.fastutil.doubles.DoubleArrayList();
+    /**
+     * Terrain sections holding blocks with a friction or restitution multiplier:
+     * bodies overlapping them route their contacts through the listener, which
+     * applies the multipliers per block pair.
+     */
+    private final LongOpenHashSet specialSections = new LongOpenHashSet();
+    /**
+     * Terrain sections holding blocks with restitution.
+     */
+    private final LongOpenHashSet bouncySections = new LongOpenHashSet();
     private final Long2ObjectOpenHashMap<ChunkSectionData> allChunks = new Long2ObjectOpenHashMap<>();
     /**
      * Plot section key → runtime id of the sub-level owning it (-1 when absent;
@@ -446,10 +582,6 @@ public final class JoltPhysicsScene {
      */
     private final LinkedHashSet<SableBody> dirtyBodies = new LinkedHashSet<>();
     private final LinkedHashSet<GlobalChunk> dirtyGlobalChunks = new LinkedHashSet<>();
-    /**
-     * Global chunks whose body could not be created (body limit reached); retried.
-     */
-    private final ReferenceOpenHashSet<GlobalChunk> pendingTerrainBodies = new ReferenceOpenHashSet<>();
 
     private int groundBodyId;
     private boolean disposed;
@@ -458,6 +590,13 @@ public final class JoltPhysicsScene {
     final double gravityY;
     final double gravityZ;
     final double universalDrag;
+    /**
+     * Unit gravity direction (see {@link #updateMotionQuality}).
+     */
+    private final boolean hasGravity;
+    private final double gravityDirX;
+    private final double gravityDirY;
+    private final double gravityDirZ;
 
     /**
      * Velocity/position solver steps requested by Sable's config; the heavy-body
@@ -476,6 +615,11 @@ public final class JoltPhysicsScene {
         this.gravityY = gravityY;
         this.gravityZ = gravityZ;
         this.universalDrag = universalDrag;
+        final double gravity = Math.sqrt(gravityX * gravityX + gravityY * gravityY + gravityZ * gravityZ);
+        this.hasGravity = gravity > 1.0e-6;
+        this.gravityDirX = this.hasGravity ? gravityX / gravity : 0.0;
+        this.gravityDirY = this.hasGravity ? gravityY / gravity : 0.0;
+        this.gravityDirZ = this.hasGravity ? gravityZ / gravity : 0.0;
 
         final int numObjLayers = NUM_OBJECT_LAYERS;
         final int numBpLayers = 2;
@@ -500,36 +644,42 @@ public final class JoltPhysicsScene {
 
         final ObjectVsBroadPhaseLayerFilterTable ovbFilter = createBroadPhaseFilter(layerMap, numBpLayers, ovoFilter, numObjLayers);
 
-        // Contacts reach Java only when one side is a report body or special
-        // terrain touches a moving body; plain resting and slow contacts are
+        // Contacts reach Java only when one side is a report body (fast bodies,
+        // bodies with special blocks or mounted contraptions, see classifyLayer)
+        // or the special terrain body. Plain resting and slow contacts are
         // handled entirely in native code.
         this.listenerFilter = new ObjectLayerPairFilterTable(numObjLayers);
         for (final int layer : new int[]{LAYER_MOVING, LAYER_MOVING_REPORT, LAYER_STATIC, LAYER_STATIC_SPECIAL, LAYER_ROPE}) {
             this.listenerFilter.enableCollision(LAYER_MOVING_REPORT, layer);
         }
-        this.listenerFilter.enableCollision(LAYER_STATIC_SPECIAL, LAYER_MOVING);
-        this.listenerFilter.enableCollision(LAYER_STATIC_SPECIAL, LAYER_ROPE);
+        this.listenerFilter.enableCollision(LAYER_MOVING, LAYER_STATIC_SPECIAL);
+        this.listenerFilter.enableCollision(LAYER_ROPE, LAYER_STATIC_SPECIAL);
 
         this.system = new PhysicsSystem();
         // The system keeps references to the layer tables; capacities come from
-        // the config (terrain uses one body per uploaded section).
+        // the config.
         this.system.init(this.config.maxBodies, 0, this.config.maxBodyPairs, this.config.maxContactConstraints,
                 layerMap, ovbFilter, ovoFilter);
         this.system.setGravity((float) gravityX, (float) gravityY, (float) gravityZ);
 
-        // Contact tuning for voxel-compound sliding. The original Rapier build
-        // lets a block platform glide over flat ground; Jolt's stiffer solver
-        // snags on the internal seams between adjacent ground boxes. Softer
-        // margins + gentler position correction + aggressive internal edge
-        // removal reproduce the glide.
         final PhysicsSettings physics = this.system.getPhysicsSettings();
-        physics.setPenetrationSlop(0.03f);
-        physics.setSpeculativeContactDistance(0.06f);
+        // Contact tolerances of Sable's Rapier world (lib.rs): bodies rest 2.5 mm
+        // deep (normalized_allowed_linear_error) instead of Jolt's 2 cm. The deeper
+        // a body rests, the more of the next block's side it overlaps at every seam.
+        physics.setPenetrationSlop(ALLOWED_PENETRATION);
+        physics.setSpeculativeContactDistance(SPECULATIVE_CONTACT_DISTANCE);
         physics.setNumVelocitySteps(this.configuredVelocitySteps);
         physics.setNumPositionSteps(this.configuredPositionSteps);
-        physics.setBaumgarte(0.12f);
-        // default 1e-8 m² is too strict for adjacent box seams; 1e-4 m² (1 cm)
-        // treats near-coplanar edges as internal and removes their spikes.
+        physics.setBaumgarte(0.2f);
+        // Swept bodies (see updateMotionQuality) cast from 0.2 x their inner radius
+        // per substep (4 m/s for a block at 2 substeps) and stop at most 5 % of it
+        // deep: an impact is caught before the body sinks into the ground, as in
+        // Rapier, instead of up to 12 cm deep with Jolt's defaults.
+        physics.setLinearCastThreshold(LINEAR_CAST_THRESHOLD);
+        physics.setLinearCastMaxPenetration(LINEAR_CAST_MAX_PENETRATION);
+        // Internal edge removal compares the vertices of touching faces; block
+        // corners of neighbouring sections match exactly, the tolerance only
+        // absorbs float rounding of the section offsets.
         physics.setInternalEdgeRemovalVertexToleranceSq(1.0e-4f);
         // Big resting structures form huge contact islands; the splitter parallelizes
         // and bounds their solve instead of one monolithic island iteration.
@@ -541,13 +691,18 @@ public final class JoltPhysicsScene {
             physics.setTimeBeforeSleep(2.0f);
         }
         this.system.setPhysicsSettings(physics);
+        if (this.rapierMode) {
+            // Rapier's default rule: the average of both frictions (Jolt's default is
+            // the geometric mean). Block multipliers are applied by the listener.
+            this.system.setCombineFriction(CombineFunction.average(true));
+        }
 
         this.bi = this.system.getBodyInterface();
         this.batchNoLock = this.system.getBodyInterfaceNoLock();
         // Fixed block for the common case; large islands fall back to malloc
         // instead of aborting the process when the block runs out.
-        this.tempAllocator = new TempAllocatorImplWithMallocFallback(8 * 1024 * 1024);
-        this.jobSystem = sharedJobSystem(this.config.physicsThreads);
+        this.tempAllocator = new TempAllocatorImplWithMallocFallback(tempAllocatorBytes(this.config.maxContactConstraints));
+        this.jobSystem = sharedJobSystem(this.config.workerThreads());
         this.singleThreadJobSystem = new JobSystemSingleThreaded(Jolt.cMaxPhysicsJobs);
 
         this.contactListener = new SceneContactListener();
@@ -558,6 +713,10 @@ public final class JoltPhysicsScene {
         this.contactListener.setEnableAdded(true);
         this.contactListener.setEnablePersisted(true);
         this.contactListener.setEnableRemoved(false);
+        // Per-contact validation would be the only way to filter seam contacts
+        // in Java, but jolt-jni attaches and detaches the JVM thread around every
+        // callback from a native worker (~23 us each). Seams are handled natively
+        // instead (terrain regions + enhanced internal edge removal).
         this.contactListener.setEnableValidate(false);
         this.system.setContactListener(this.contactListener);
 
@@ -628,13 +787,21 @@ public final class JoltPhysicsScene {
     //region Body records
 
     /**
-     * One collision leaf: a box of the block at (bx, by, bz). Coordinates are in
+     * One collision leaf: a box of the block at (bx, by, bz), or a merged box of
+     * full cubes from (bx, by, bz) to (ex, ey, ez) inclusive. Coordinates are in
      * the owner's block space (plot or contraption-local), world space for terrain.
      */
     public static final class Child {
         public final int bx;
         public final int by;
         public final int bz;
+        public final int ex;
+        public final int ey;
+        public final int ez;
+        /**
+         * Collider of the block; for a merged box, of one of its blocks (all of
+         * them share the same contact behavior).
+         */
         public final int colliderId;
         /**
          * The body the block belongs to; null for terrain.
@@ -643,11 +810,38 @@ public final class JoltPhysicsScene {
         public final SableBody owner;
 
         public Child(final int bx, final int by, final int bz, final int colliderId, @Nullable final SableBody owner) {
+            this(bx, by, bz, bx, by, bz, colliderId, owner);
+        }
+
+        public Child(final int bx, final int by, final int bz, final int ex, final int ey, final int ez,
+                     final int colliderId, @Nullable final SableBody owner) {
             this.bx = bx;
             this.by = by;
             this.bz = bz;
+            this.ex = ex;
+            this.ey = ey;
+            this.ez = ez;
             this.colliderId = colliderId;
             this.owner = owner;
+        }
+
+        public boolean merged() {
+            return this.ex != this.bx || this.ey != this.by || this.ez != this.bz;
+        }
+
+        /**
+         * The block of this leaf closest to a point in the owner's block space.
+         */
+        public int nearestX(final double x) {
+            return Math.max(this.bx, Math.min(this.ex, (int) Math.floor(x)));
+        }
+
+        public int nearestY(final double y) {
+            return Math.max(this.by, Math.min(this.ey, (int) Math.floor(y)));
+        }
+
+        public int nearestZ(final double z) {
+            return Math.max(this.bz, Math.min(this.ez, (int) Math.floor(z)));
         }
     }
 
@@ -687,10 +881,15 @@ public final class JoltPhysicsScene {
          * Holds blocks with special contact behavior (friction, restitution, callbacks).
          */
         final boolean special;
+        /**
+         * Holds blocks with restitution (see {@link JoltPhysicsScene#updateMotionQuality}).
+         */
+        final boolean bouncy;
 
         BodySection(final long key, final ConstShape shape, @Nullable final ShapeRefC ref,
                     final double ox, final double oy, final double oz,
-                    final Child[] children, final int leafBits, final int[] blocks, final float[] volumes, final boolean special) {
+                    final Child[] children, final int leafBits, final int[] blocks, final float[] volumes, final boolean special,
+                    final boolean bouncy) {
             this.key = key;
             this.shape = shape;
             this.ref = ref;
@@ -702,6 +901,7 @@ public final class JoltPhysicsScene {
             this.blocks = blocks;
             this.volumes = volumes;
             this.special = special;
+            this.bouncy = bouncy;
         }
 
         @Nullable
@@ -786,9 +986,37 @@ public final class JoltPhysicsScene {
         int parentBits;
         int leafCount;
         /**
+         * Motion quality is LinearCast ({@link JoltPhysicsScene#updateMotionQuality}).
+         */
+        boolean sweeping;
+        /**
          * Contacts must always reach the listener: special blocks or mounted contraptions.
          */
         boolean layerSpecial;
+        /**
+         * Overlaps terrain with friction or restitution multipliers (see
+         * {@link JoltPhysicsScene#classifyLayer}): its terrain contacts sample
+         * the blocks they touch.
+         */
+        volatile boolean nearSpecial;
+        /**
+         * Holds blocks with restitution, or overlaps terrain holding some: moves
+         * discretely (see {@link JoltPhysicsScene#updateMotionQuality}).
+         */
+        boolean bouncy;
+        volatile boolean nearBouncy;
+        /**
+         * Where and when this body last gave the terrain around it surface
+         * meshes (see {@link JoltPhysicsScene#updateMeshedSections}).
+         */
+        double meshedAtX = Double.NaN;
+        double meshedAtY = Double.NaN;
+        double meshedAtZ = Double.NaN;
+        long meshedAtFlush = Long.MIN_VALUE / 2;
+        /**
+         * Some of its sections are still waiting for their mesh (rate limit).
+         */
+        boolean meshPending;
         /**
          * Upper bound of the distance from the center of mass to any block.
          */
@@ -924,42 +1152,63 @@ public final class JoltPhysicsScene {
         }
     }
 
-    public static final class GlobalChunk {
-        final int cx;
-        final int cy;
-        final int cz;
-        ChunkSectionData data;
-        int joltId;
-
-        /**
-         * The Java wrapper of the native body; must stay referenced for the body's
-         * whole lifetime.
-         */
-        Body body;
-
-        /**
-         * Section shape, local to the section's minimum corner (the static body
-         * sits there; world-absolute float offsets lose precision far from spawn).
-         */
+    /**
+     * The geometry of one terrain layer of a section, local to the section's
+     * minimum corner (its tile places that corner; world-absolute float offsets
+     * lose precision far from spawn). Either a box part alone (a compound of
+     * boxes, or one wrapped box), a single surface mesh, or a compound of the
+     * surface meshes followed by the box part.
+     */
+    static final class TerrainPart {
+        @Nullable
         ConstShape shape;
-
+        /**
+         * Keeps a created shape alive.
+         */
+        @Nullable
+        ShapeRefC ref;
+        /**
+         * Box leaves, in sub-shape order of the box part.
+         */
         Child[] children = NO_CHILDREN;
+        /**
+         * Sub-shape ID bits of the box part; 0 for a single leaf.
+         */
         int leafBits;
         /**
-         * Holds blocks with special contact behavior (friction, restitution, callbacks).
+         * One entry per surface mesh (the block range of the whole section).
          */
-        boolean special;
-        boolean layerSpecial;
+        Child[] meshChildren = NO_CHILDREN;
+        /**
+         * Sub-shape ID bits of the compound of meshes and box part; 0 when the
+         * shape is the box part or the only mesh itself.
+         */
+        int partBits;
 
-        GlobalChunk(final int cx, final int cy, final int cz, final ChunkSectionData data) {
-            this.cx = cx;
-            this.cy = cy;
-            this.cz = cz;
-            this.data = data;
+        void clear() {
+            this.shape = null;
+            this.ref = null;
+            this.children = NO_CHILDREN;
+            this.leafBits = 0;
+            this.meshChildren = NO_CHILDREN;
+            this.partBits = 0;
         }
 
         @Nullable
         Child childAt(final int subShapeId) {
+            final Child[] meshes = this.meshChildren;
+            if (meshes.length == 0) {
+                return this.leafAt(subShapeId);
+            }
+            if (this.partBits == 0) {
+                return this.children.length == 0 ? meshes[0] : null;
+            }
+            final int part = subShapeId & ((1 << this.partBits) - 1);
+            return part < meshes.length ? meshes[part] : this.leafAt(subShapeId >>> this.partBits);
+        }
+
+        @Nullable
+        private Child leafAt(final int subShapeId) {
             final Child[] c = this.children;
             if (c.length == 0) {
                 return null;
@@ -969,6 +1218,137 @@ public final class JoltPhysicsScene {
             }
             final int j = subShapeId & ((1 << this.leafBits) - 1);
             return j < c.length ? c[j] : null;
+        }
+    }
+
+    public static final class GlobalChunk {
+        final int cx;
+        final int cy;
+        final int cz;
+        final long key;
+        ChunkSectionData data;
+
+        /**
+         * Geometry per terrain layer ({@link #TERRAIN_PLAIN}, {@link #TERRAIN_SPECIAL}).
+         */
+        final TerrainPart[] parts = {new TerrainPart(), new TerrainPart()};
+        /**
+         * The tile this section belongs to.
+         */
+        @Nullable
+        TerrainTile tile;
+
+        GlobalChunk(final int cx, final int cy, final int cz, final ChunkSectionData data) {
+            this.cx = cx;
+            this.cy = cy;
+            this.cz = cz;
+            this.key = ChunkSectionData.packSectionPos(cx, cy, cz);
+            this.data = data;
+        }
+    }
+
+    /**
+     * One terrain layer of a tile: the compound of its sections' parts.
+     */
+    static final class TileLayer {
+        /**
+         * Sections in the compound, in sub-shape order.
+         */
+        GlobalChunk[] assembled = new GlobalChunk[0];
+        @Nullable
+        ConstShape shape;
+        /**
+         * Keeps a created static compound alive.
+         */
+        @Nullable
+        ShapeRefC ref;
+    }
+
+    /**
+     * 4x4x4 terrain sections, assembled into one compound per terrain layer of
+     * the region bodies.
+     */
+    static final class TerrainTile {
+        final long key;
+        final TerrainRegion region;
+        final int tx;
+        final int ty;
+        final int tz;
+        /**
+         * Every section of the tile, with or without geometry.
+         */
+        final ReferenceOpenHashSet<GlobalChunk> members = new ReferenceOpenHashSet<>();
+        final TileLayer[] layers = {new TileLayer(), new TileLayer()};
+
+        TerrainTile(final long key, final TerrainRegion region, final int tx, final int ty, final int tz) {
+            this.key = key;
+            this.region = region;
+            this.tx = tx;
+            this.ty = ty;
+            this.tz = tz;
+        }
+
+        @Nullable
+        Child childAt(final int layer, final int subShapeId) {
+            final GlobalChunk[] secs = this.layers[layer].assembled;
+            final int bits = subShapeBits(secs.length);
+            final int index = bits == 0 ? 0 : subShapeId & ((1 << bits) - 1);
+            return index < secs.length ? secs[index].parts[layer].childAt(subShapeId >>> bits) : null;
+        }
+    }
+
+    /**
+     * One static body of a terrain region: a mutable compound of the tile
+     * compounds of one terrain layer, rebuilt when tiles change.
+     */
+    static final class RegionLayer {
+        final TerrainRegion region;
+        final int layer;
+        /**
+         * Tiles in the body's compound, in sub-shape order.
+         */
+        TerrainTile[] assembled = new TerrainTile[0];
+        @Nullable
+        MutableCompoundShape shape;
+        @Nullable
+        Body body;
+        int joltId;
+
+        RegionLayer(final TerrainRegion region, final int layer) {
+            this.region = region;
+            this.layer = layer;
+        }
+
+        @Nullable
+        Child childAt(final int subShapeId) {
+            final TerrainTile[] tiles = this.assembled;
+            final int bits = subShapeBits(tiles.length);
+            final int index = bits == 0 ? 0 : subShapeId & ((1 << bits) - 1);
+            return index < tiles.length ? tiles[index].childAt(this.layer, subShapeId >>> bits) : null;
+        }
+    }
+
+    /**
+     * The terrain of 64x64 sections (all heights): one static body per terrain layer.
+     */
+    static final class TerrainRegion {
+        final long key;
+        final int rx;
+        final int rz;
+        /**
+         * Block coordinates of the body origins.
+         */
+        final int originX;
+        final int originZ;
+        final ObjectArrayList<TerrainTile> tiles = new ObjectArrayList<>();
+        final RegionLayer[] layers = {new RegionLayer(this, TERRAIN_PLAIN), new RegionLayer(this, TERRAIN_SPECIAL)};
+
+        TerrainRegion(final long key, final int rx, final int rz) {
+            this.key = key;
+            this.rx = rx;
+            this.rz = rz;
+            this.originX = rx << (REGION_SECTION_SHIFT + 4);
+            this.originZ = rz << (REGION_SECTION_SHIFT + 4);
         }
     }
 
@@ -982,6 +1362,10 @@ public final class JoltPhysicsScene {
         public TwoBodyConstraintSettings genericSettings;
         public final double[][] limits = new double[6][2];
         public final boolean[] locked = new boolean[6];
+        /** Viscous drag between the anchors (per second), see {@link #applyJointDampers}. */
+        public boolean damper;
+        public double linearDamping;
+        public double angularDamping;
     }
 
     public static final class RopeAttachment {
@@ -1052,6 +1436,10 @@ public final class JoltPhysicsScene {
         bcs.setFriction(sb.kind == SableBody.Kind.CONTRAPTION ? FRICTION_CONTRAPTION : FRICTION_SUB_LEVEL);
         bcs.setRestitution(0.0f);
         bcs.setApplyGyroscopicForce(true);
+        // Drops the ghost contacts with the internal edges of whatever this body
+        // touches: the seams between the blocks of another sub-level, as Rapier's
+        // interior collision test does (terrain regions set it themselves).
+        bcs.setEnhancedInternalEdgeRemoval(true);
         bcs.setOverrideMassProperties(EOverrideMassProperties.CalculateMassAndInertia);
         if (this.rapierMode && sb.kind == SableBody.Kind.SUB_LEVEL) {
             bcs.setMaxLinearVelocity(RAPIER_MAX_LINEAR_VELOCITY);
@@ -1076,6 +1464,7 @@ public final class JoltPhysicsScene {
         sb.listIndex = this.bodyList.size();
         sb.snapValid = true;
         sb.snapActive = sb.kind != SableBody.Kind.CONTRAPTION;
+        sb.sweeping = true; // created LinearCast, see updateMotionQuality
         this.bodyList.add(sb);
         this.bodiesByJoltId.put(sb.joltId, sb);
         sb.boundsDirty = true;
@@ -1285,6 +1674,7 @@ public final class JoltPhysicsScene {
         bcs.setMotionQuality(EMotionQuality.LinearCast);
         bcs.setFriction(FRICTION_BOX);
         bcs.setApplyGyroscopicForce(true);
+        bcs.setEnhancedInternalEdgeRemoval(true);
         final MassProperties mp = new MassProperties();
         mp.setMass((float) Math.max(mass, 1.0e-3));
         bcs.setOverrideMassProperties(EOverrideMassProperties.CalculateInertia);
@@ -1302,8 +1692,10 @@ public final class JoltPhysicsScene {
 
         final SableBody sb = new SableBody(SableBody.Kind.BOX, id);
         sb.joltId = body.getId();
+        sb.sweeping = true;
         sb.layer = LAYER_MOVING_REPORT;
         sb.body = body;
+        sb.boundRadius = (float) Math.sqrt(hx * hx + hy * hy + hz * hz);
         sb.snapX = sb.snapComX = pos.x();
         sb.snapY = sb.snapComY = pos.y();
         sb.snapZ = sb.snapComZ = pos.z();
@@ -1930,11 +2322,11 @@ public final class JoltPhysicsScene {
         sb.buoyancyCount = blocks;
 
         // CCD (LinearCast) sweeps the ENTIRE compound against the world every step;
-        // for huge bodies that costs seconds per tick while they fall. Huge bodies
-        // move slowly in practice, so switch them to discrete motion.
-        if (sb.body != null && sb.kind == SableBody.Kind.SUB_LEVEL && leaves >= HEAVY_BODY_CHILDREN
-                && this.bi.getMotionQuality(sb.joltId) != EMotionQuality.Discrete) {
+        // for huge bodies that costs seconds per tick while they fall. Large bodies
+        // start discrete; updateMotionQuality sweeps them again while they are fast.
+        if (sb.body != null && sb.kind == SableBody.Kind.SUB_LEVEL && leaves >= SPEED_SWEPT_BODY_CHILDREN && sb.sweeping) {
             this.bi.setMotionQuality(sb.joltId, EMotionQuality.Discrete);
+            sb.sweeping = false;
         }
     }
 
@@ -1986,10 +2378,13 @@ public final class JoltPhysicsScene {
         sb.shape = parent;
         sb.embedded = embedded;
         boolean special = embedded.length > 0;
+        boolean bouncy = false;
         for (final BodySection s : secs) {
             special |= s.special;
+            bouncy |= s.bouncy;
         }
         sb.layerSpecial = special;
+        sb.bouncy = bouncy;
         if (special && sb.body != null && sb.layer == LAYER_MOVING) {
             this.setBodyLayer(sb, LAYER_MOVING_REPORT);
         }
@@ -2015,36 +2410,74 @@ public final class JoltPhysicsScene {
     }
 
     /**
-     * Reusable per-thread leaf accumulator for {@link #buildBodySection}:
-     * flat primitive arrays instead of one {@code Vec3} + list node per leaf.
-     * A 16³ section holds at most a few thousand leaves; the arrays grow once
-     * per thread and are reused by every later section.
+     * Reusable leaf accumulator of one compound: flat primitive arrays instead
+     * of one {@code Vec3} + list node per leaf. A 16³ section holds at most a
+     * few thousand leaves; the arrays grow once per thread and are reused by
+     * every later section.
      */
-    private static final class SectionScratch {
+    private static final class LeafList {
         float[] ox = new float[256];
         float[] oy = new float[256];
         float[] oz = new float[256];
         ConstShape[] shapes = new ConstShape[256];
         Child[] children = new Child[256];
         int count;
+
+        void add(final float x, final float y, final float z, final ConstShape shape, final Child child) {
+            final int i = this.count;
+            if (i == this.ox.length) {
+                final int cap = i << 1;
+                this.ox = Arrays.copyOf(this.ox, cap);
+                this.oy = Arrays.copyOf(this.oy, cap);
+                this.oz = Arrays.copyOf(this.oz, cap);
+                this.shapes = Arrays.copyOf(this.shapes, cap);
+                this.children = Arrays.copyOf(this.children, cap);
+            }
+            this.ox[i] = x;
+            this.oy[i] = y;
+            this.oz[i] = z;
+            this.shapes[i] = shape;
+            this.children[i] = child;
+            this.count = i + 1;
+        }
+
+        void release() {
+            // Do not pin native shapes between rebuilds.
+            Arrays.fill(this.shapes, 0, this.count, null);
+            Arrays.fill(this.children, 0, this.count, null);
+            this.count = 0;
+        }
+    }
+
+    /**
+     * Reusable per-thread scratch of the section builders.
+     */
+    private static final class SectionScratch {
+        /**
+         * Leaves of plain blocks (all leaves of a sub-level section) and of
+         * blocks with special contact behavior (terrain only).
+         */
+        final LeafList plain = new LeafList();
+        final LeafList special = new LeafList();
         int[] blocks = new int[768];
         float[] volumes = new float[256];
         int blockCount;
-
-        void ensure(final int needed) {
-            if (needed <= this.ox.length) {
-                return;
-            }
-            int cap = this.ox.length;
-            while (cap < needed) {
-                cap <<= 1;
-            }
-            this.ox = Arrays.copyOf(this.ox, cap);
-            this.oy = Arrays.copyOf(this.oy, cap);
-            this.oz = Arrays.copyOf(this.oz, cap);
-            this.shapes = Arrays.copyOf(this.shapes, cap);
-            this.children = Arrays.copyOf(this.children, cap);
-        }
+        /**
+         * Per cell of the section: merge class (0 = not mergeable), collider and
+         * whether the block is enclosed (interior), see {@link #emitMergedBoxes}.
+         */
+        final int[] mergeClass = new int[ChunkSectionData.BLOCKS];
+        final int[] mergeCollider = new int[ChunkSectionData.BLOCKS];
+        final boolean[] mergeInterior = new boolean[ChunkSectionData.BLOCKS];
+        final boolean[] mergeUsed = new boolean[ChunkSectionData.BLOCKS];
+        /**
+         * Surface mesh scratch (terrain): solid full cubes of the section, the
+         * exposed faces of one plane, and the triangles (9 floats each).
+         */
+        final boolean[] fullCube = new boolean[ChunkSectionData.BLOCKS];
+        final boolean[] faceMask = new boolean[256];
+        float[] triangles = new float[9 * 1024];
+        int triangleFloats;
 
         void ensureBlocks(final int needed) {
             if (needed <= this.volumes.length) {
@@ -2058,17 +2491,467 @@ public final class JoltPhysicsScene {
             this.volumes = Arrays.copyOf(this.volumes, cap);
         }
 
-        void releaseRefs() {
-            // Do not pin native shapes between rebuilds.
-            Arrays.fill(this.shapes, 0, this.count, null);
-            Arrays.fill(this.children, 0, this.count, null);
-            this.count = 0;
+        void reset() {
+            this.plain.release();
+            this.special.release();
             this.blockCount = 0;
+            this.triangleFloats = 0;
+            Arrays.fill(this.mergeClass, 0);
+        }
+
+        void releaseRefs() {
+            this.plain.release();
+            this.special.release();
+            this.blockCount = 0;
+        }
+
+        void addTriangle(final float ax, final float ay, final float az, final float bx, final float by, final float bz,
+                         final float cx, final float cy, final float cz) {
+            int i = this.triangleFloats;
+            if (i + 9 > this.triangles.length) {
+                this.triangles = Arrays.copyOf(this.triangles, this.triangles.length << 1);
+            }
+            final float[] t = this.triangles;
+            t[i++] = ax;
+            t[i++] = ay;
+            t[i++] = az;
+            t[i++] = bx;
+            t[i++] = by;
+            t[i++] = bz;
+            t[i++] = cx;
+            t[i++] = cy;
+            t[i++] = cz;
+            this.triangleFloats = i;
         }
     }
 
     private static final ThreadLocal<SectionScratch> SECTION_SCRATCH =
             ThreadLocal.withInitial(SectionScratch::new);
+
+    /**
+     * Merge class of blocks without special contact behavior: they merge with
+     * each other whatever block they are.
+     */
+    private static final int MERGE_DEFAULT = Integer.MAX_VALUE;
+
+
+    /**
+     * Whether a collider is one solid full cube (its neighbours' faces against it are hidden).
+     */
+    private static boolean isFullCube(@Nullable final JoltVoxelColliderData entry) {
+        return entry != null && !entry.isFluid && entry.boxes.size() == 1 && entry.boxes.get(0).fullCube();
+    }
+
+    /**
+     * Classifies one cell for {@link #emitMergedBoxes}: a solid full cube with a
+     * single box and no contact callback merges with neighbours of the same
+     * contact behavior (interior blocks included: they fill the merged boxes).
+     *
+     * @return whether the cell was classified mergeable
+     */
+    private static boolean classifyMergeable(final SectionScratch s, final int idx, final int packed, final int colliderId,
+                                             @Nullable final JoltVoxelColliderData entry) {
+        final int state = ChunkSectionData.voxelStateOf(packed);
+        if (colliderId <= 0 || entry == null || entry.isFluid || entry.contactEvents != null || state < 1 || state > 4
+                || entry.boxes.size() != 1 || !entry.boxes.get(0).fullCube()) {
+            s.mergeClass[idx] = 0;
+            return false;
+        }
+        s.mergeClass[idx] = entry.needsSpecialContacts() ? colliderId : MERGE_DEFAULT;
+        s.mergeCollider[idx] = colliderId;
+        s.mergeInterior[idx] = state == 4;
+        return true;
+    }
+
+    /**
+     * Greedily merges the mergeable cells of a section into boxes (along x, then
+     * z, then y) and appends them as leaves. Boxes made only of interior blocks
+     * are enclosed and skipped, as Rapier skips interior blocks. Merging is what
+     * keeps big flat contacts cheap: a 30 x 30 plate on flat ground touches a
+     * handful of boxes instead of 3600 block pairs (Rapier gets there by only
+     * colliding the corner blocks of flat surfaces, dispatcher.rs).
+     *
+     * @param anyClass  merge every mergeable block regardless of its contact
+     *                  behavior (volume boxes under a surface mesh)
+     * @param exactRuns stack rows only while the next row's run spans exactly
+     *                  the same x range (boxes that are contact surfaces)
+     * @param recess    inset of every box face (boxes under a surface mesh)
+     */
+    private void emitMergedBoxes(final SectionScratch s, final LeafList out, final int baseX, final int baseY, final int baseZ,
+                                 @Nullable final SableBody owner, final boolean anyClass, final boolean exactRuns, final float recess) {
+        final int[] cls = s.mergeClass;
+        if (anyClass) {
+            for (int i = 0; i < cls.length; i++) {
+                if (cls[i] != 0) {
+                    cls[i] = MERGE_DEFAULT;
+                }
+            }
+        }
+        final boolean[] used = s.mergeUsed;
+        Arrays.fill(used, false);
+        for (int y = 0; y < 16; y++) {
+            for (int z = 0; z < 16; z++) {
+                for (int x = 0; x < 16; x++) {
+                    final int idx = ChunkSectionData.index(x, y, z);
+                    final int c = cls[idx];
+                    if (c == 0 || used[idx]) {
+                        continue;
+                    }
+                    int x1 = x;
+                    while (x1 + 1 < 16 && !used[idx + (x1 + 1 - x)] && cls[idx + (x1 + 1 - x)] == c) {
+                        x1++;
+                    }
+                    // With exact runs, rows are stacked only while the next row's
+                    // run spans exactly the same x range: a box must not take part
+                    // of a longer run, which would leave the rest of that run as a
+                    // box whose corner sits in the middle of this box's edge. Jolt
+                    // only drops seam contacts between faces with matching corners.
+                    int z1 = z;
+                    zLoop:
+                    while (z1 + 1 < 16) {
+                        for (int xx = x; xx <= x1; xx++) {
+                            final int n = ChunkSectionData.index(xx, y, z1 + 1);
+                            if (used[n] || cls[n] != c) {
+                                break zLoop;
+                            }
+                        }
+                        if (exactRuns && x > 0) {
+                            final int before = ChunkSectionData.index(x - 1, y, z1 + 1);
+                            if (!used[before] && cls[before] == c) {
+                                break;
+                            }
+                        }
+                        if (exactRuns && x1 < 15) {
+                            final int after = ChunkSectionData.index(x1 + 1, y, z1 + 1);
+                            if (!used[after] && cls[after] == c) {
+                                break;
+                            }
+                        }
+                        z1++;
+                    }
+                    int y1 = y;
+                    yLoop:
+                    while (y1 + 1 < 16) {
+                        for (int zz = z; zz <= z1; zz++) {
+                            for (int xx = x; xx <= x1; xx++) {
+                                final int n = ChunkSectionData.index(xx, y1 + 1, zz);
+                                if (used[n] || cls[n] != c) {
+                                    break yLoop;
+                                }
+                            }
+                        }
+                        y1++;
+                    }
+                    boolean exposed = false;
+                    for (int yy = y; yy <= y1; yy++) {
+                        for (int zz = z; zz <= z1; zz++) {
+                            for (int xx = x; xx <= x1; xx++) {
+                                final int n = ChunkSectionData.index(xx, yy, zz);
+                                used[n] = true;
+                                exposed |= !s.mergeInterior[n];
+                            }
+                        }
+                    }
+                    if (!exposed) {
+                        continue;
+                    }
+                    final float hx = (x1 - x + 1) * 0.5f;
+                    final float hy = (y1 - y + 1) * 0.5f;
+                    final float hz = (z1 - z + 1) * 0.5f;
+                    out.add(x + hx, y + hy, z + hz, this.sharedBoxShape(hx - recess, hy - recess, hz - recess),
+                            new Child(baseX + x, baseY + y, baseZ + z, baseX + x1, baseY + y1, baseZ + z1, s.mergeCollider[idx], owner));
+                }
+            }
+        }
+    }
+
+    // region Surface meshes
+
+    /**
+     * Section offsets of the face neighbour in each direction (-x, +x, -y, +y, -z, +z).
+     */
+    private static final int[] FACE_DX = {-1, 1, 0, 0, 0, 0};
+    private static final int[] FACE_DY = {0, 0, -1, 1, 0, 0};
+    private static final int[] FACE_DZ = {0, 0, 0, 0, -1, 1};
+
+    /**
+     * Builds the surface mesh of the mergeable full cubes of a terrain section
+     * into {@code s.triangles}: their faces not covered by a solid full cube
+     * (the neighbouring sections decide the faces on the section border). Each
+     * face plane is cut into 4x4 patches aligned with the section: a patch full
+     * of faces is two triangles, or a fan from its center when an edge borders a
+     * partly filled patch or the section border (that edge is then split at
+     * every block); a partly filled patch is two triangles per face. Neighbouring
+     * patches of all sections thus share their vertices exactly, and no triangle
+     * is thin: Jolt drops every contact with an edge between two coplanar faces
+     * by matching their vertices (enhanced internal edge removal), which merged
+     * boxes cannot provide where they meet with a T-junction, and slivers make
+     * its contact normals drift.
+     *
+     * @return the number of triangles
+     */
+    private int buildSurfaceMesh(final SectionScratch s, final GlobalChunk chunk) {
+        s.triangleFloats = 0;
+        final int[] cls = s.mergeClass;
+        final boolean[] full = s.fullCube;
+        final int[][] neighbours = new int[6][];
+        for (int d = 0; d < 6; d++) {
+            final GlobalChunk n = this.globalChunks.get(ChunkSectionData.packSectionPos(chunk.cx + FACE_DX[d], chunk.cy + FACE_DY[d], chunk.cz + FACE_DZ[d]));
+            neighbours[d] = n == null ? null : n.data.array();
+        }
+        final boolean[] mask = s.faceMask;
+        final int[] patches = new int[16];
+        for (int d = 0; d < 6; d++) {
+            final int axis = d >> 1;
+            final boolean positive = (d & 1) == 1;
+            final int[] across = neighbours[d];
+            for (int layer = 0; layer < 16; layer++) {
+                final int next = positive ? layer + 1 : layer - 1;
+                final boolean border = next < 0 || next > 15;
+                boolean any = false;
+                for (int v = 0; v < 16; v++) {
+                    for (int u = 0; u < 16; u++) {
+                        final int idx = cellIndex(axis, layer, u, v);
+                        boolean face = cls[idx] != 0;
+                        if (face) {
+                            if (!border) {
+                                face = !full[cellIndex(axis, next, u, v)];
+                            } else if (across != null) {
+                                final int packed = across[cellIndex(axis, next & 15, u, v)];
+                                final int colliderId = ChunkSectionData.colliderIdOf(packed);
+                                face = colliderId == 0 || !isFullCube(this.colliderRegistry.get(colliderId - 1));
+                            }
+                        }
+                        mask[u + (v << 4)] = face;
+                        any |= face;
+                    }
+                }
+                if (!any) {
+                    continue;
+                }
+                final int plane = positive ? layer + 1 : layer;
+                for (int p = 0; p < 16; p++) {
+                    final int u0 = (p & 3) << 2, v0 = (p >> 2) << 2;
+                    int count = 0;
+                    for (int v = v0; v < v0 + 4; v++) {
+                        for (int u = u0; u < u0 + 4; u++) {
+                            if (mask[u + (v << 4)]) {
+                                count++;
+                            }
+                        }
+                    }
+                    patches[p] = count;
+                }
+                // 8x8 quadrants of four full patches become one patch when every
+                // patch along their edges is full or empty (a fan from their
+                // center over corners and edge midpoints keeps triangles wide).
+                int quads = 0;
+                for (int q = 0; q < 4; q++) {
+                    final int pu0 = (q & 1) << 1, pv0 = (q >> 1) << 1;
+                    final int p00 = pu0 + (pv0 << 2);
+                    if (patches[p00] != 16 || patches[p00 + 1] != 16 || patches[p00 + 4] != 16 || patches[p00 + 5] != 16) {
+                        continue;
+                    }
+                    boolean balanced = true;
+                    for (int k = 0; k < 2 && balanced; k++) {
+                        balanced = !partial(this.ringPatch(patches, chunk, d, layer, pu0 - 1, pv0 + k))
+                                && !partial(this.ringPatch(patches, chunk, d, layer, pu0 + 2, pv0 + k))
+                                && !partial(this.ringPatch(patches, chunk, d, layer, pu0 + k, pv0 - 1))
+                                && !partial(this.ringPatch(patches, chunk, d, layer, pu0 + k, pv0 + 2));
+                    }
+                    if (balanced) {
+                        quads |= 1 << q;
+                    }
+                }
+                for (int q = 0; q < 4; q++) {
+                    if ((quads & (1 << q)) == 0) {
+                        continue;
+                    }
+                    final int qu = q & 1, qv = q >> 1;
+                    final int pu0 = qu << 1, pv0 = qv << 1;
+                    final int u0 = pu0 << 2, v0 = pv0 << 2;
+                    // An edge gets its midpoint unless the other side is a
+                    // quadrant patch of this section, or holds no faces at all.
+                    final boolean bottom = qv == 1 && (quads & (1 << (q - 2))) != 0 ? false
+                            : this.ringPatch(patches, chunk, d, layer, pu0, pv0 - 1) + this.ringPatch(patches, chunk, d, layer, pu0 + 1, pv0 - 1) != 0;
+                    final boolean right = qu == 0 && (quads & (1 << (q + 1))) != 0 ? false
+                            : this.ringPatch(patches, chunk, d, layer, pu0 + 2, pv0) + this.ringPatch(patches, chunk, d, layer, pu0 + 2, pv0 + 1) != 0;
+                    final boolean top = qv == 0 && (quads & (1 << (q + 2))) != 0 ? false
+                            : this.ringPatch(patches, chunk, d, layer, pu0, pv0 + 2) + this.ringPatch(patches, chunk, d, layer, pu0 + 1, pv0 + 2) != 0;
+                    final boolean left = qu == 1 && (quads & (1 << (q - 1))) != 0 ? false
+                            : this.ringPatch(patches, chunk, d, layer, pu0 - 1, pv0) + this.ringPatch(patches, chunk, d, layer, pu0 - 1, pv0 + 1) != 0;
+                    emitPatch(s, axis, positive, plane, u0, v0, 8, bottom, right, top, left, 4);
+                }
+                for (int p = 0; p < 16; p++) {
+                    final int count = patches[p];
+                    if (count == 0) {
+                        continue;
+                    }
+                    final int pu = p & 3, pv = p >> 2;
+                    if ((quads & (1 << ((pu >> 1) + ((pv >> 1) << 1)))) != 0) {
+                        continue;
+                    }
+                    final int u0 = pu << 2, v0 = pv << 2;
+                    if (count < 16) {
+                        for (int v = v0; v < v0 + 4; v++) {
+                            for (int u = u0; u < u0 + 4; u++) {
+                                if (mask[u + (v << 4)]) {
+                                    face(s, axis, positive, plane, u, v, u + 1, v, u + 1, v + 1);
+                                    face(s, axis, positive, plane, u, v, u + 1, v + 1, u, v + 1);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // An edge is split where the plane goes on in a partly filled
+                    // patch, of this section or of the neighbouring one (which
+                    // decides the same way about its side of the edge).
+                    final boolean bottom = partial(pv == 0 ? this.neighbourPatch(chunk, d, layer, 0, -1, pu, 3) : patches[p - 4]);
+                    final boolean right = partial(pu == 3 ? this.neighbourPatch(chunk, d, layer, 1, 0, 0, pv) : patches[p + 1]);
+                    final boolean top = partial(pv == 3 ? this.neighbourPatch(chunk, d, layer, 0, 1, pu, 0) : patches[p + 4]);
+                    final boolean left = partial(pu == 0 ? this.neighbourPatch(chunk, d, layer, -1, 0, 3, pv) : patches[p - 1]);
+                    emitPatch(s, axis, positive, plane, u0, v0, 4, bottom, right, top, left, 1);
+                }
+            }
+        }
+        return s.triangleFloats / 9;
+    }
+
+    /**
+     * Triangulates a full square patch of a face plane: two triangles, or a
+     * fan from its center when edges are split (every {@code step} blocks).
+     */
+    private static void emitPatch(final SectionScratch s, final int axis, final boolean positive, final int plane,
+                                  final int u0, final int v0, final int size,
+                                  final boolean bottom, final boolean right, final boolean top, final boolean left, final int step) {
+        if (!bottom && !right && !top && !left) {
+            face(s, axis, positive, plane, u0, v0, u0 + size, v0, u0 + size, v0 + size);
+            face(s, axis, positive, plane, u0, v0, u0 + size, v0 + size, u0, v0 + size);
+            return;
+        }
+        final int cu = u0 + (size >> 1), cv = v0 + (size >> 1);
+        final int sb = bottom ? step : size, sr = right ? step : size, st = top ? step : size, sl = left ? step : size;
+        for (int i = 0; i < size; i += sb) {
+            face(s, axis, positive, plane, cu, cv, u0 + i, v0, u0 + i + sb, v0);
+        }
+        for (int i = 0; i < size; i += sr) {
+            face(s, axis, positive, plane, cu, cv, u0 + size, v0 + i, u0 + size, v0 + i + sr);
+        }
+        for (int i = size; i > 0; i -= st) {
+            face(s, axis, positive, plane, cu, cv, u0 + i, v0 + size, u0 + i - st, v0 + size);
+        }
+        for (int i = size; i > 0; i -= sl) {
+            face(s, axis, positive, plane, cu, cv, u0, v0 + i, u0, v0 + i - sl);
+        }
+    }
+
+    private static boolean partial(final int patchCount) {
+        return patchCount != 0 && patchCount != 16;
+    }
+
+    /**
+     * Face count of a 4x4 patch of the current plane by patch coordinates,
+     * which may lie one patch outside this section.
+     */
+    private int ringPatch(final int[] patches, final GlobalChunk chunk, final int d, final int layer, final int pu, final int pv) {
+        if (pu >= 0 && pu < 4 && pv >= 0 && pv < 4) {
+            return patches[pu + (pv << 2)];
+        }
+        return this.neighbourPatch(chunk, d, layer, pu < 0 ? -1 : pu > 3 ? 1 : 0, pv < 0 ? -1 : pv > 3 ? 1 : 0, pu & 3, pv & 3);
+    }
+
+    /**
+     * Number of faces in a 4x4 patch of the same face plane (direction
+     * {@code d}, cell layer {@code layer}) of the section next to {@code chunk}
+     * along the plane's u or v axis (0 when that section is not loaded).
+     */
+    private int neighbourPatch(final GlobalChunk chunk, final int d, final int layer, final int du, final int dv, final int pu, final int pv) {
+        final int axis = d >> 1;
+        // in-plane axes (u, v) of each face axis: x: (y, z), y: (z, x), z: (x, y)
+        final int ox = axis == 1 ? dv : axis == 2 ? du : 0;
+        final int oy = axis == 0 ? du : axis == 2 ? dv : 0;
+        final int oz = axis == 0 ? dv : axis == 1 ? du : 0;
+        final GlobalChunk n = this.globalChunks.get(ChunkSectionData.packSectionPos(chunk.cx + ox, chunk.cy + oy, chunk.cz + oz));
+        if (n == null) {
+            return 0;
+        }
+        final int[] data = n.data.array();
+        final boolean positive = (d & 1) == 1;
+        final int next = positive ? layer + 1 : layer - 1;
+        int[] beyond = data;
+        if (next < 0 || next > 15) {
+            final GlobalChunk b = this.globalChunks.get(ChunkSectionData.packSectionPos(n.cx + FACE_DX[d], n.cy + FACE_DY[d], n.cz + FACE_DZ[d]));
+            beyond = b == null ? null : b.data.array();
+        }
+        int count = 0;
+        for (int v = pv << 2; v < (pv << 2) + 4; v++) {
+            for (int u = pu << 2; u < (pu << 2) + 4; u++) {
+                if (!this.isMeshCube(data[cellIndex(axis, layer, u, v)])) {
+                    continue;
+                }
+                if (beyond == null) {
+                    count++;
+                    continue;
+                }
+                final int covering = ChunkSectionData.colliderIdOf(beyond[cellIndex(axis, next & 15, u, v)]);
+                if (covering == 0 || !isFullCube(this.colliderRegistry.get(covering - 1))) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Whether a block is part of the terrain surface mesh: the blocks
+     * {@link #classifyMergeable} accepts.
+     */
+    private boolean isMeshCube(final int packed) {
+        final int colliderId = ChunkSectionData.colliderIdOf(packed);
+        if (colliderId <= 0) {
+            return false;
+        }
+        final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
+        final int state = ChunkSectionData.voxelStateOf(packed);
+        return entry != null && entry.contactEvents == null && state >= 1 && state <= 4 && isFullCube(entry);
+    }
+
+    /**
+     * Emits one triangle given counter-clockwise in plane coordinates (u, v),
+     * wound to face +axis or -axis.
+     */
+    private static void face(final SectionScratch s, final int axis, final boolean positive, final int plane,
+                             final int u0, final int v0, final int u1, final int v1, final int u2, final int v2) {
+        if (positive) {
+            planeTriangle(s, axis, plane, u0, v0, u1, v1, u2, v2);
+        } else {
+            planeTriangle(s, axis, plane, u0, v0, u2, v2, u1, v1);
+        }
+    }
+
+    /**
+     * Index of a section cell given by its coordinate along a face axis and the
+     * two in-plane coordinates (u, v), where (u, v, axis) is right-handed:
+     * x: (y, z), y: (z, x), z: (x, y).
+     */
+    private static int cellIndex(final int axis, final int a, final int u, final int v) {
+        return switch (axis) {
+            case 0 -> ChunkSectionData.index(a, u, v);
+            case 1 -> ChunkSectionData.index(v, a, u);
+            default -> ChunkSectionData.index(u, v, a);
+        };
+    }
+
+    private static void planeTriangle(final SectionScratch s, final int axis, final int plane,
+                                      final int u0, final int v0, final int u1, final int v1, final int u2, final int v2) {
+        switch (axis) {
+            case 0 -> s.addTriangle(plane, u0, v0, plane, u1, v1, plane, u2, v2);
+            case 1 -> s.addTriangle(v0, plane, u0, v1, plane, u1, v2, plane, u2);
+            default -> s.addTriangle(u0, v0, plane, u1, v1, plane, u2, v2, plane);
+        }
+    }
+
+    // endregion
 
     /**
      * Builds one section of a body from its chunk data, or returns null when
@@ -2090,9 +2973,10 @@ public final class JoltPhysicsScene {
         final int blockMinZ = cz << 4;
 
         final SectionScratch scratch = SECTION_SCRATCH.get();
-        scratch.count = 0;
-        scratch.blockCount = 0;
+        scratch.reset();
+        final LeafList leaves = scratch.plain;
         boolean special = false;
+        boolean bouncy = false;
 
         final boolean checkBounds = !contraption;
         final boolean hasBounds = sb.hasBounds;
@@ -2132,24 +3016,27 @@ public final class JoltPhysicsScene {
                             rejectLog = appendReject(rejectLog, worldX, worldY, worldZ, reason);
                         }
 
-                        if (!solid) {
-                            continue;
-                        }
                         if (checkBounds && !(hasBounds
                                 && worldX >= bMinX && worldX <= bMaxX
                                 && worldY >= bMinY && worldY <= bMaxY
                                 && worldZ >= bMinZ && worldZ <= bMaxZ)) {
                             continue;
                         }
-
-                        final int blockIndex = scratch.blockCount;
-                        scratch.ensureBlocks(blockIndex + 1);
-                        scratch.blocks[blockIndex * 3] = worldX;
-                        scratch.blocks[blockIndex * 3 + 1] = worldY;
-                        scratch.blocks[blockIndex * 3 + 2] = worldZ;
-                        scratch.volumes[blockIndex] = entry.volume;
-                        special |= entry.needsSpecialContacts();
-                        scratch.blockCount = blockIndex + 1;
+                        if (solid) {
+                            final int blockIndex = scratch.blockCount;
+                            scratch.ensureBlocks(blockIndex + 1);
+                            scratch.blocks[blockIndex * 3] = worldX;
+                            scratch.blocks[blockIndex * 3 + 1] = worldY;
+                            scratch.blocks[blockIndex * 3 + 2] = worldZ;
+                            scratch.volumes[blockIndex] = entry.volume;
+                            special |= entry.needsSpecialContacts();
+                            bouncy |= entry.restitution > 0.0f;
+                            scratch.blockCount = blockIndex + 1;
+                        }
+                        // Full cubes become merged boxes after the scan.
+                        if (classifyMergeable(scratch, cellBase + bx, packed, colliderId, entry) || !solid) {
+                            continue;
+                        }
 
                         final ObjectArrayList<JoltVoxelColliderData.VoxelBox> secBoxes = entry.boxes;
                         final int elementsSize = secBoxes.size();
@@ -2158,44 +3045,39 @@ public final class JoltPhysicsScene {
                         for (int i = 0; i < elementsSize; i++) {
                             final JoltVoxelColliderData.VoxelBox box =
                                     (JoltVoxelColliderData.VoxelBox) elements[i];
-                            final int idx = scratch.count;
-                            scratch.ensure(idx + 1);
                             // Offsets relative to the section corner: small floats,
                             // exact even at plot coordinates in the millions.
-                            scratch.ox[idx] = bx + (box.minX + box.maxX) * 0.5f;
-                            scratch.oy[idx] = by + (box.minY + box.maxY) * 0.5f;
-                            scratch.oz[idx] = bz + (box.minZ + box.maxZ) * 0.5f;
-                            scratch.shapes[idx] = entry.shape(i);
-                            scratch.children[idx] = new Child(worldX, worldY, worldZ, colliderId, sb);
-                            scratch.count = idx + 1;
+                            leaves.add(bx + (box.minX + box.maxX) * 0.5f, by + (box.minY + box.maxY) * 0.5f, bz + (box.minZ + box.maxZ) * 0.5f,
+                                    entry.shape(i), new Child(worldX, worldY, worldZ, colliderId, sb));
                         }
                     }
                 }
             }
+            this.emitMergedBoxes(scratch, leaves, blockMinX, blockMinY, blockMinZ, sb, false, true, 0.0f);
 
             if (JoltDebugLogging.STAFF && rejectLog != null) {
                 Sable.LOGGER.info("[SableJolt] rebuild body {}: rejected: {}", sb.runtimeId, rejectLog);
             }
-            final int leafCount = scratch.count;
+            final int leafCount = leaves.count;
             if (leafCount == 0) {
                 return null;
             }
 
-            final Child[] children = Arrays.copyOf(scratch.children, leafCount);
+            final Child[] children = Arrays.copyOf(leaves.children, leafCount);
             final int[] uniqueBlocks = Arrays.copyOf(scratch.blocks, scratch.blockCount * 3);
             final float[] volumes = Arrays.copyOf(scratch.volumes, scratch.blockCount);
 
             if (leafCount == 1) {
                 // A single leaf goes into the parent directly: Jolt's compound
                 // create() would return the leaf itself and drop its offset.
-                return new BodySection(key, scratch.shapes[0], null,
-                        blockMinX + (double) scratch.ox[0], blockMinY + (double) scratch.oy[0], blockMinZ + (double) scratch.oz[0],
-                        children, 0, uniqueBlocks, volumes, special);
+                return new BodySection(key, leaves.shapes[0], null,
+                        blockMinX + (double) leaves.ox[0], blockMinY + (double) leaves.oy[0], blockMinZ + (double) leaves.oz[0],
+                        children, 0, uniqueBlocks, volumes, special, bouncy);
             }
 
             final StaticCompoundShapeSettings settings = new StaticCompoundShapeSettings();
             for (int i = 0; i < leafCount; i++) {
-                settings.addShape(scratch.ox[i], scratch.oy[i], scratch.oz[i], scratch.shapes[i]);
+                settings.addShape(leaves.ox[i], leaves.oy[i], leaves.oz[i], leaves.shapes[i]);
             }
             final ShapeResult result = settings.create();
             if (result.hasError()) {
@@ -2209,7 +3091,7 @@ public final class JoltPhysicsScene {
             // section origin is the corner itself.
             return new BodySection(key, ref.getPtr(), ref,
                     blockMinX, blockMinY, blockMinZ,
-                    children, subShapeBits(leafCount), uniqueBlocks, volumes, special);
+                    children, subShapeBits(leafCount), uniqueBlocks, volumes, special, bouncy);
         } catch (final Throwable t) {
             Sable.LOGGER.error("[SableJolt] body {}: failed to build section ({},{},{})", sb.runtimeId, cx, cy, cz, t);
             return null;
@@ -2228,8 +3110,8 @@ public final class JoltPhysicsScene {
     //region Chunks
 
     /**
-     * Stores a chunk section. Global sections get (or refresh) their static
-     * terrain body; plot sections mark the owning sub-level's section dirty.
+     * Stores a chunk section. Global sections get (or refresh) their terrain
+     * shape; plot sections mark the owning sub-level's section dirty.
      *
      * @param ownerId runtime id of the sub-level owning a plot section (-1 if unknown)
      */
@@ -2241,7 +3123,7 @@ public final class JoltPhysicsScene {
         final ChunkSectionData existing = this.allChunks.get(key);
         if (global && existing != null && Arrays.equals(existing.array(), data)) {
             // Re-upload of identical terrain (e.g. Sable adopting a section the
-            // pipeline uploaded ahead of it): keep the body as is.
+            // pipeline uploaded ahead of it): keep the shape as is.
             final GlobalChunk chunk = this.globalChunks.get(key);
             if (chunk != null) {
                 return;
@@ -2259,14 +3141,14 @@ public final class JoltPhysicsScene {
                 chunk = new GlobalChunk(x, y, z, section);
                 this.globalChunks.put(key, chunk);
             } else {
-                // Reuse the body: only its shape changes.
                 chunk.data = section;
             }
-            this.dirtyGlobalChunks.remove(chunk);
-            this.refreshGlobalChunkBody(chunk);
+            // Built before the next step, once even if its neighbours arrive in
+            // the same tick: their surface meshes depend on each other.
+            this.dirtyGlobalChunks.add(chunk);
+            this.markNeighboursDirty(x, y, z);
             if (JoltDebugLogging.STAFF) {
-                Sable.LOGGER.info("[SableJolt] addChunk GLOBAL at ({},{},{}) children={} totalGlobal={}",
-                        x, y, z, chunk.children.length, this.globalChunks.size());
+                Sable.LOGGER.info("[SableJolt] addChunk GLOBAL at ({},{},{}) totalGlobal={}", x, y, z, this.globalChunks.size());
             }
             return;
         }
@@ -2335,7 +3217,7 @@ public final class JoltPhysicsScene {
         this.flushCounter++;
         if ((this.flushCounter & 31) == 0) {
             this.retryPendingCreation();
-            this.retryPendingTerrain();
+            this.retryRegionBodies();
         }
         if (!this.dirtyBodies.isEmpty()) {
             final ObjectArrayList<SableBody> list;
@@ -2367,15 +3249,104 @@ public final class JoltPhysicsScene {
             }
             this.rebuildAll(others);
         }
+        this.updateMeshedSections();
         if (!this.dirtyGlobalChunks.isEmpty()) {
-            for (final GlobalChunk chunk : this.dirtyGlobalChunks) {
-                try {
-                    this.refreshGlobalChunkBody(chunk);
-                } catch (final Throwable t) {
-                    Sable.LOGGER.error("[SableJolt] failed to refresh global chunk ({},{},{})", chunk.cx, chunk.cy, chunk.cz, t);
+            this.refreshDirtyGlobalChunks();
+        }
+        this.flushTerrain();
+    }
+
+    /**
+     * Gives the terrain sections around awake bodies their surface mesh (see
+     * {@link #MESH_MARGIN}) and takes it back from sections no body came near
+     * for a while. A body refreshes its sections when it moved a few blocks
+     * since it last did, or every half keep time.
+     */
+    private void updateMeshedSections() {
+        final long now = this.flushCounter;
+        final LongArrayList upgrades = this.meshUpgrades;
+        final it.unimi.dsi.fastutil.doubles.DoubleArrayList distances = this.meshUpgradeDistances;
+        upgrades.clear();
+        distances.clear();
+        boolean pending = false;
+        for (final SableBody sb : this.bodyList) {
+            if (sb.body == null || !sb.snapActive || (sb.kind != SableBody.Kind.SUB_LEVEL && sb.kind != SableBody.Kind.BOX)) {
+                continue;
+            }
+            final double dx = sb.snapComX - sb.meshedAtX, dy = sb.snapComY - sb.meshedAtY, dz = sb.snapComZ - sb.meshedAtZ;
+            if (!sb.meshPending && dx * dx + dy * dy + dz * dz < 16.0 && now - sb.meshedAtFlush < MESH_KEEP_STEPS / 2) {
+                continue;
+            }
+            sb.meshedAtX = sb.snapComX;
+            sb.meshedAtY = sb.snapComY;
+            sb.meshedAtZ = sb.snapComZ;
+            sb.meshedAtFlush = now;
+            sb.meshPending = false;
+            final double r = sb.boundRadius + MESH_MARGIN;
+            final double look = MESH_LOOKAHEAD, cap = MESH_MAX_LOOKAHEAD;
+            final double ax = Math.max(-cap, Math.min(cap, sb.snapVx * look));
+            final double ay = Math.max(-cap, Math.min(cap, sb.snapVy * look));
+            final double az = Math.max(-cap, Math.min(cap, sb.snapVz * look));
+            final int x0 = floor(sb.snapComX + Math.min(0.0, ax) - r) >> 4, x1 = floor(sb.snapComX + Math.max(0.0, ax) + r) >> 4;
+            final int y0 = floor(sb.snapComY + Math.min(0.0, ay) - r) >> 4, y1 = floor(sb.snapComY + Math.max(0.0, ay) + r) >> 4;
+            final int z0 = floor(sb.snapComZ + Math.min(0.0, az) - r) >> 4, z1 = floor(sb.snapComZ + Math.max(0.0, az) + r) >> 4;
+            for (int x = x0; x <= x1; x++) {
+                for (int y = y0; y <= y1; y++) {
+                    for (int z = z0; z <= z1; z++) {
+                        final long key = ChunkSectionData.packSectionPos(x, y, z);
+                        if (!this.globalChunks.containsKey(key)) {
+                            continue;
+                        }
+                        if (this.meshedSections.containsKey(key)) {
+                            this.meshedSections.put(key, now + MESH_KEEP_STEPS);
+                            continue;
+                        }
+                        final double ex = (x << 4) + 8 - sb.snapComX, ey = (y << 4) + 8 - sb.snapComY, ez = (z << 4) + 8 - sb.snapComZ;
+                        upgrades.add(key);
+                        distances.add(ex * ex + ey * ey + ez * ez);
+                        sb.meshPending = true;
+                    }
                 }
             }
-            this.dirtyGlobalChunks.clear();
+        }
+        if (!upgrades.isEmpty()) {
+            // nearest first, a bounded number per step; bodies with sections left
+            // over come back next step (meshPending)
+            final int n = upgrades.size();
+            final int[] order = new int[n];
+            for (int i = 0; i < n; i++) {
+                order[i] = i;
+            }
+            it.unimi.dsi.fastutil.ints.IntArrays.quickSort(order, (a, b) -> Double.compare(distances.getDouble(a), distances.getDouble(b)));
+            int added = 0;
+            for (int i = 0; i < n && added < MESH_UPGRADES_PER_FLUSH; i++) {
+                final long key = upgrades.getLong(order[i]);
+                if (this.meshedSections.containsKey(key)) {
+                    continue;
+                }
+                this.meshedSections.put(key, now + MESH_KEEP_STEPS);
+                this.dirtyGlobalChunks.add(this.globalChunks.get(key));
+                added++;
+            }
+            pending = added < n;
+        }
+        if (!pending) {
+            for (final SableBody sb : this.bodyList) {
+                sb.meshPending = false;
+            }
+        }
+        if ((now & 63) == 0 && !this.meshedSections.isEmpty()) {
+            final var it = this.meshedSections.long2LongEntrySet().fastIterator();
+            while (it.hasNext()) {
+                final var e = it.next();
+                if (e.getLongValue() < now) {
+                    final GlobalChunk chunk = this.globalChunks.get(e.getLongKey());
+                    it.remove();
+                    if (chunk != null) {
+                        this.dirtyGlobalChunks.add(chunk);
+                    }
+                }
+            }
         }
     }
 
@@ -2426,19 +3397,62 @@ public final class JoltPhysicsScene {
             return;
         }
         this.fluidSections.remove(key);
-        this.destroyGlobalChunkBody(chunk);
+        this.specialSections.remove(key);
+        this.bouncySections.remove(key);
         // a removed chunk must not be touched by a pending flush
         this.dirtyGlobalChunks.remove(chunk);
-        this.pendingTerrainBodies.remove(chunk);
+        final TerrainTile tile = chunk.tile;
+        if (tile != null) {
+            tile.members.remove(chunk);
+            chunk.tile = null;
+            this.dirtyTiles.add(tile);
+        }
+        // the neighbours' faces against this section are exposed now
+        this.markNeighboursDirty(chunk.cx, chunk.cy, chunk.cz);
     }
 
-    private void destroyGlobalChunkBody(final GlobalChunk chunk) {
-        if (chunk.joltId != 0) {
-            this.globalChunksByBodyId.remove(chunk.joltId);
-            this.bi.removeBody(chunk.joltId);
-            this.bi.destroyBody(chunk.joltId);
-            chunk.joltId = 0;
-            chunk.body = null;
+    /**
+     * Queues the 26 neighbours of a terrain section for a rebuild: their surface
+     * meshes hide the faces against full cubes of this section, and shape the
+     * patches along their borders after the patches of this section (and of
+     * its neighbours, see {@link #neighbourPatch}).
+     */
+    private void markNeighboursDirty(final int cx, final int cy, final int cz) {
+        for (int ox = -1; ox <= 1; ox++) {
+            for (int oy = -1; oy <= 1; oy++) {
+                for (int oz = -1; oz <= 1; oz++) {
+                    if (ox != 0 || oy != 0 || oz != 0) {
+                        this.markSectionDirty(cx + ox, cy + oy, cz + oz);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Queues the neighbours of a terrain section whose surface mesh depends on
+     * the block at section-local (lx, ly, lz): those within one patch (4 blocks)
+     * of it across their border.
+     */
+    private void markNeighboursDirty(final int cx, final int cy, final int cz, final int lx, final int ly, final int lz) {
+        final int x0 = lx < 4 ? -1 : 0, x1 = lx > 11 ? 1 : 0;
+        final int y0 = ly < 4 ? -1 : 0, y1 = ly > 11 ? 1 : 0;
+        final int z0 = lz < 4 ? -1 : 0, z1 = lz > 11 ? 1 : 0;
+        for (int ox = x0; ox <= x1; ox++) {
+            for (int oy = y0; oy <= y1; oy++) {
+                for (int oz = z0; oz <= z1; oz++) {
+                    if (ox != 0 || oy != 0 || oz != 0) {
+                        this.markSectionDirty(cx + ox, cy + oy, cz + oz);
+                    }
+                }
+            }
+        }
+    }
+
+    private void markSectionDirty(final int cx, final int cy, final int cz) {
+        final GlobalChunk chunk = this.globalChunks.get(ChunkSectionData.packSectionPos(cx, cy, cz));
+        if (chunk != null && this.meshedSections.containsKey(chunk.key)) {
+            this.dirtyGlobalChunks.add(chunk);
         }
     }
 
@@ -2488,6 +3502,9 @@ public final class JoltPhysicsScene {
             final GlobalChunk chunk = this.globalChunks.get(key);
             if (chunk != null) {
                 this.dirtyGlobalChunks.add(chunk);
+                // Blocks near the section border show or hide faces of the
+                // neighbouring sections' surface meshes, or reshape their patches.
+                this.markNeighboursDirty(wx[i] >> 4, wy[i] >> 4, wz[i] >> 4, wx[i] & 15, wy[i] & 15, wz[i] & 15);
             }
         }
     }
@@ -2501,28 +3518,18 @@ public final class JoltPhysicsScene {
     }
 
     /**
-     * Scratch classification arrays for {@link #buildGlobalChunkShape} (server
-     * thread only — chunk bodies are refreshed sequentially): reuses 20 KB per
-     * refresh instead of allocating it.
+     * Rebuilds a terrain section's geometry from its data, local to the section
+     * corner, in two layers. Blocks without a contact callback: a surface mesh
+     * of the full cubes' exposed faces (see {@link #buildSurfaceMesh}) over the
+     * same cubes merged into boxes and inset by {@link #TERRAIN_RECESS}, plus
+     * one box per collision box of other solid blocks. Their friction and
+     * restitution multipliers are applied by the contact listener per block
+     * pair ({@link SceneContactListener#sampleBlockPairs}). Blocks with a
+     * contact callback: one box per collision box, in the region's second body.
      */
-    private final int[] globalCellScratch = new int[ChunkSectionData.BLOCKS];
-    private final boolean[] globalUsedScratch = new boolean[ChunkSectionData.BLOCKS];
-
-    /**
-     * Rebuilds the static chunk body's shape from the section data. Full cubes
-     * of the same block are greedily merged into slabs: a platform sliding over
-     * per-block ground boxes sinks a few mm (contact slop) and its leading edge
-     * then hits the vertical seam wall of the next box, which reads as
-     * "tripping over a stone". Merged slabs remove the seams within a chunk.
-     * Blocks with collision callbacks keep individual boxes so callbacks see
-     * the exact block. The shape is local to the section corner.
-     */
-    private void buildGlobalChunkShape(final GlobalChunk chunk) {
-        final Vec3 mutableVec3 = new Vec3();
-        final StaticCompoundShapeSettings settings = new StaticCompoundShapeSettings();
-        final ObjectArrayList<Child> children = new ObjectArrayList<>();
-        final ObjectArrayList<ConstShape> leafShapes = new ObjectArrayList<>();
-        final FloatArrayCollector offsets = new FloatArrayCollector();
+    private int buildGlobalChunkShape(final GlobalChunk chunk) {
+        final SectionScratch scratch = SECTION_SCRATCH.get();
+        scratch.reset();
 
         final int baseX = chunk.cx << 4;
         final int baseY = chunk.cy << 4;
@@ -2531,262 +3538,614 @@ public final class JoltPhysicsScene {
 
         boolean anyFluid = false;
         boolean special = false;
-
-        // Pass 1: classify cells (positive id = mergeable full cube, negative =
-        // individual boxes).
-        final int[] cellCollider = this.globalCellScratch;
-        Arrays.fill(cellCollider, 0);
-        for (int idx = 0; idx < ChunkSectionData.BLOCKS; idx++) {
-            final int packed = data[idx];
-            if (packed == 0) {
-                continue;
-            }
-            final int colliderId = ChunkSectionData.colliderIdOf(packed);
-            final JoltVoxelColliderData entry = colliderId == 0 ? null : this.colliderRegistry.get(colliderId - 1);
-            if (entry == null) {
-                continue;
-            }
-            // fluids are marked for buoyancy even though they never collide
-            if (entry.isFluid) {
-                anyFluid = true;
-            }
-            if (!isSolidBlock(packed, entry)) {
-                continue;
-            }
-            final ObjectArrayList<JoltVoxelColliderData.VoxelBox> boxes = entry.boxes;
-            final boolean mergeable = boxes.size() == 1 && boxes.get(0).fullCube() && entry.contactEvents == null;
-            cellCollider[idx] = mergeable ? colliderId : -colliderId;
-            special |= entry.needsSpecialContacts();
-        }
-
-        // Pass 2a: greedy rectangles per Y layer over mergeable cells.
-        final boolean[] used = this.globalUsedScratch;
-        Arrays.fill(used, false);
-        for (int by = 0; by < 16; by++) {
-            final int layerBase = by << 8;
-            for (int bz = 0; bz < 16; bz++) {
-                final int rowBase = layerBase + (bz << 4);
-                for (int bx = 0; bx < 16; bx++) {
-                    final int idx = rowBase + bx;
-                    final int id = cellCollider[idx];
-                    if (id <= 0 || used[idx]) {
-                        continue;
-                    }
-                    // extend along X
-                    int x1 = bx;
-                    while (x1 + 1 < 16 && !used[rowBase + x1 + 1] && cellCollider[rowBase + x1 + 1] == id) {
-                        x1++;
-                    }
-                    // extend along Z while the whole X span matches
-                    int z1 = bz;
-                    zLoop:
-                    while (z1 + 1 < 16) {
-                        final int nextRow = layerBase + ((z1 + 1) << 4);
-                        for (int x = bx; x <= x1; x++) {
-                            final int nIdx = nextRow + x;
-                            if (used[nIdx] || cellCollider[nIdx] != id) {
-                                break zLoop;
-                            }
+        boolean bouncy = false;
+        int plainCollider = 0;
+        int specialCollider = 0;
+        try {
+            // NOTE: children stay 1:1 with compound leaf sub-shapes, in this order.
+            for (int idx = 0; idx < ChunkSectionData.BLOCKS; idx++) {
+                final int packed = data[idx];
+                scratch.fullCube[idx] = false;
+                if (packed == 0) {
+                    continue;
+                }
+                final int colliderId = ChunkSectionData.colliderIdOf(packed);
+                final JoltVoxelColliderData entry = colliderId == 0 ? null : this.colliderRegistry.get(colliderId - 1);
+                if (entry == null) {
+                    continue;
+                }
+                // fluids are marked for buoyancy even though they never collide
+                if (entry.isFluid) {
+                    anyFluid = true;
+                }
+                scratch.fullCube[idx] = isFullCube(entry);
+                if (classifyMergeable(scratch, idx, packed, colliderId, entry)) {
+                    if (scratch.mergeClass[idx] == MERGE_DEFAULT) {
+                        if (plainCollider == 0) {
+                            plainCollider = colliderId;
                         }
-                        z1++;
-                    }
-                    for (int z = bz; z <= z1; z++) {
-                        final int r = layerBase + (z << 4);
-                        for (int x = bx; x <= x1; x++) {
-                            used[r + x] = true;
+                    } else {
+                        special = true;
+                        bouncy |= entry.restitution > 0.0f;
+                        if (specialCollider == 0) {
+                            specialCollider = colliderId;
                         }
                     }
-
-                    // The slab needs its OWN box shape sized to the merge — reusing
-                    // the unit box would leave collision only in its center cell.
-                    // Shapes are shared by size across the whole world.
-                    final float sx = (x1 - bx + 1) * 0.5f;
-                    final float sz = (z1 - bz + 1) * 0.5f;
-                    leafShapes.add(this.sharedBoxShape(sx, 0.5f, sz));
-                    offsets.add(bx + sx, by + 0.5f, bz + sz);
-                    children.add(new Child(baseX + bx, baseY + by, baseZ + bz, id, null));
+                    continue;
+                }
+                if (!isSolidBlock(packed, entry)) {
+                    continue;
+                }
+                special |= entry.contactEvents == null && entry.needsSpecialContacts();
+                bouncy |= entry.restitution > 0.0f;
+                final LeafList leaves = entry.contactEvents != null ? scratch.special : scratch.plain;
+                final int bx = idx & 15;
+                final int bz = (idx >> 4) & 15;
+                final int by = idx >> 8;
+                final ObjectArrayList<JoltVoxelColliderData.VoxelBox> boxes = entry.boxes;
+                final int size = boxes.size();
+                final Object[] elements = boxes.elements();
+                for (int i = 0; i < size; i++) {
+                    final JoltVoxelColliderData.VoxelBox box = (JoltVoxelColliderData.VoxelBox) elements[i];
+                    leaves.add(bx + (box.minX + box.maxX) * 0.5f, by + (box.minY + box.maxY) * 0.5f, bz + (box.minZ + box.maxZ) * 0.5f,
+                            entry.shape(i), new Child(baseX + bx, baseY + by, baseZ + bz, colliderId, null));
                 }
             }
-        }
-
-        // Pass 2b: other colliders keep their individual boxes.
-        for (int idx = 0; idx < ChunkSectionData.BLOCKS; idx++) {
-            final int colliderId = cellCollider[idx];
-            if (colliderId >= 0) {
-                continue; // air or already merged
+            final int meshCollider = plainCollider != 0 ? plainCollider : specialCollider;
+            if (meshCollider != 0 && this.meshedSections.containsKey(chunk.key)) {
+                // The mesh carries the contacts of full cubes; under it the boxes
+                // only hold deep penetrations: merged whatever the block, plain
+                // greedy merging (T-junctions do not matter there).
+                final int triangles = this.buildSurfaceMesh(scratch, chunk);
+                this.emitMergedBoxes(scratch, scratch.plain, baseX, baseY, baseZ, null, true, false, TERRAIN_RECESS);
+                this.assembleTerrainPart(chunk, chunk.parts[TERRAIN_PLAIN], scratch.plain, scratch, triangles, meshCollider);
+            } else {
+                // Away from moving bodies: full cubes merged per contact behavior
+                // into boxes that are the contact surface themselves.
+                this.emitMergedBoxes(scratch, scratch.plain, baseX, baseY, baseZ, null, false, true, 0.0f);
+                this.assembleTerrainPart(chunk, chunk.parts[TERRAIN_PLAIN], scratch.plain, scratch, 0, 0);
             }
-            final int id = -colliderId;
-            final JoltVoxelColliderData entry = this.colliderRegistry.get(id - 1);
-            if (entry == null || entry.isFluid) {
+            this.assembleTerrainPart(chunk, chunk.parts[TERRAIN_SPECIAL], scratch.special, scratch, 0, 0);
+            return (anyFluid ? SECTION_FLUID : 0) | (special ? SECTION_SPECIAL : 0) | (bouncy ? SECTION_BOUNCY : 0);
+        } finally {
+            scratch.releaseRefs();
+        }
+    }
+
+    /**
+     * Creates one terrain layer of a section from its box leaves and (plain
+     * layer) the surface mesh triangles in the scratch.
+     */
+    private void assembleTerrainPart(final GlobalChunk chunk, final TerrainPart part, final LeafList leaves,
+                                     final SectionScratch scratch, final int triangles, final int meshCollider) {
+        part.clear();
+        final int baseX = chunk.cx << 4;
+        final int baseY = chunk.cy << 4;
+        final int baseZ = chunk.cz << 4;
+
+        // Surface meshes, at most MAX_MESH_TRIANGLES each (sub-shape id bits).
+        final int meshCount = (triangles + MAX_MESH_TRIANGLES - 1) / MAX_MESH_TRIANGLES;
+        final ShapeRefC[] meshes = new ShapeRefC[meshCount];
+        int built = 0;
+        for (int m = 0; m < meshCount; m++) {
+            final int first = m * MAX_MESH_TRIANGLES;
+            final int count = Math.min(MAX_MESH_TRIANGLES, triangles - first);
+            final FloatBuffer buffer = Jolt.newDirectFloatBuffer(count * 9);
+            buffer.put(scratch.triangles, first * 9, count * 9).flip();
+            final ShapeResult result = new MeshShapeSettings(buffer).create();
+            if (result.hasError()) {
+                Sable.LOGGER.error("[SableJolt] terrain section ({},{},{}) surface mesh failed: {}", chunk.cx, chunk.cy, chunk.cz, result.getError());
                 continue;
             }
-            final int bx = idx & 15;
-            final int bz = (idx >> 4) & 15;
-            final int by = idx >> 8;
-            final ObjectArrayList<JoltVoxelColliderData.VoxelBox> boxes = entry.boxes;
-            final int size = boxes.size();
-            final Object[] elements = boxes.elements();
-            for (int i = 0; i < size; i++) {
-                final JoltVoxelColliderData.VoxelBox box = (JoltVoxelColliderData.VoxelBox) elements[i];
-                leafShapes.add(entry.shape(i));
-                offsets.add(bx + (box.minX + box.maxX) * 0.5f,
-                        by + (box.minY + box.maxY) * 0.5f,
-                        bz + (box.minZ + box.maxZ) * 0.5f);
-                children.add(new Child(baseX + bx, baseY + by, baseZ + bz, id, null));
+            meshes[built++] = result.get();
+        }
+        final Child[] meshChildren = new Child[built];
+        for (int m = 0; m < built; m++) {
+            meshChildren[m] = new Child(baseX, baseY, baseZ, baseX + 15, baseY + 15, baseZ + 15, meshCollider, null);
+        }
+
+        // The box part: one wrapped box, or a compound of boxes in the section frame.
+        final int n = leaves.count;
+        ConstShape boxes = null;
+        ShapeRefC boxesRef = null;
+        if (n >= 2) {
+            final StaticCompoundShapeSettings settings = new StaticCompoundShapeSettings();
+            for (int i = 0; i < n; i++) {
+                settings.addShape(leaves.ox[i], leaves.oy[i], leaves.oz[i], leaves.shapes[i]);
             }
+            final ShapeResult result = settings.create();
+            if (result.hasError()) {
+                Sable.LOGGER.error("[SableJolt] terrain section ({},{},{}) shape failed: {}", chunk.cx, chunk.cy, chunk.cz, result.getError());
+                return;
+            }
+            boxesRef = result.get();
+            boxes = boxesRef.getPtr();
         }
+        final Child[] children = n == 0 ? NO_CHILDREN : Arrays.copyOf(leaves.children, n);
 
-        final long key = ChunkSectionData.packSectionPos(chunk.cx, chunk.cy, chunk.cz);
-        if (anyFluid) {
-            this.fluidSections.add(key);
-        } else {
-            this.fluidSections.remove(key);
-        }
-        chunk.special = special;
-
-        final int leafCount = children.size();
-        if (leafCount == 0) {
-            chunk.shape = null;
-            chunk.children = NO_CHILDREN;
-            chunk.leafBits = 0;
+        if (built == 0) {
+            if (n == 0) {
+                return;
+            }
+            part.children = children;
+            if (n == 1) {
+                // A single leaf cannot carry an offset on its own, and a static
+                // compound of one child collapses into it: wrap it.
+                final Vec3 offset = this.sectionVecScratch.get();
+                offset.set(leaves.ox[0], leaves.oy[0], leaves.oz[0]);
+                final MutableCompoundShape single = new MutableCompoundShape();
+                single.addShape(offset, IDENTITY_QUAT, leaves.shapes[0]);
+                part.shape = single;
+                return;
+            }
+            part.shape = boxes;
+            part.ref = boxesRef;
+            part.leafBits = subShapeBits(n);
             return;
         }
-        if (leafCount == 1) {
-            // A single leaf cannot carry an offset on its own: wrap it so the
-            // body can stay at the section corner.
-            final float[] o = offsets.array();
-            mutableVec3.set(o[0], o[1], o[2]);
-            final MutableCompoundShape single = new MutableCompoundShape();
-            single.addShape(mutableVec3, IDENTITY_QUAT, leafShapes.get(0));
-            chunk.shape = single;
-            chunk.children = children.toArray(NO_CHILDREN);
-            chunk.leafBits = 0;
+        part.meshChildren = meshChildren;
+        if (built == 1 && n == 0) {
+            // The mesh is already in the section frame.
+            part.ref = meshes[0];
+            part.shape = meshes[0].getPtr();
             return;
         }
-        final float[] o = offsets.array();
-        for (int i = 0; i < leafCount; i++) {
-            settings.addShape(o[i * 3], o[i * 3 + 1], o[i * 3 + 2], leafShapes.get(i));
+        // Meshes first, then the box part: a mesh's triangle ids then sit above
+        // the few part bits instead of above the leaf bits (sub-shape ids are
+        // 32 bits), and the leaf ids stay exact.
+        final StaticCompoundShapeSettings settings = new StaticCompoundShapeSettings();
+        for (int m = 0; m < built; m++) {
+            settings.addShape(0.0f, 0.0f, 0.0f, meshes[m].getPtr());
+        }
+        if (n == 1) {
+            settings.addShape(leaves.ox[0], leaves.oy[0], leaves.oz[0], leaves.shapes[0]);
+        } else if (n >= 2) {
+            settings.addShape(0.0f, 0.0f, 0.0f, boxes);
         }
         final ShapeResult result = settings.create();
         if (result.hasError()) {
             Sable.LOGGER.error("[SableJolt] terrain section ({},{},{}) shape failed: {}", chunk.cx, chunk.cy, chunk.cz, result.getError());
-            chunk.shape = null;
-            chunk.children = NO_CHILDREN;
-            chunk.leafBits = 0;
+            part.clear();
             return;
         }
-        chunk.shape = result.get();
-        chunk.children = children.toArray(NO_CHILDREN);
-        chunk.leafBits = subShapeBits(leafCount);
+        part.ref = result.get();
+        part.shape = part.ref.getPtr();
+        part.children = children;
+        part.leafBits = subShapeBits(n);
+        part.partBits = subShapeBits(built + (n > 0 ? 1 : 0));
     }
 
     /**
-     * Growable float triple list (terrain leaf offsets).
+     * Rebuilds a terrain section's shape and queues its tile for reassembly.
      */
-    private static final class FloatArrayCollector {
-        private float[] data = new float[96];
-        private int size;
+    /**
+     * Section kinds {@link #buildGlobalChunkShape} reports.
+     */
+    private static final int SECTION_FLUID = 1;
+    private static final int SECTION_SPECIAL = 2;
+    private static final int SECTION_BOUNCY = 4;
 
-        void add(final float x, final float y, final float z) {
-            if (this.size + 3 > this.data.length) {
-                this.data = Arrays.copyOf(this.data, this.data.length * 2);
+    /**
+     * Rebuilds the dirty terrain sections (on the worker pool when there are
+     * many: a section only reads the chunk stores and the collider registry)
+     * and queues their tiles for reassembly.
+     */
+    private void refreshDirtyGlobalChunks() {
+        final GlobalChunk[] chunks = new GlobalChunk[this.dirtyGlobalChunks.size()];
+        int n = 0;
+        for (final GlobalChunk chunk : this.dirtyGlobalChunks) {
+            // Staleness guard: a chunk that was removed can linger in dirtyGlobalChunks.
+            if (this.globalChunks.get(chunk.key) == chunk) {
+                chunks[n++] = chunk;
             }
-            this.data[this.size++] = x;
-            this.data[this.size++] = y;
-            this.data[this.size++] = z;
         }
+        this.dirtyGlobalChunks.clear();
+        final int[] kinds = new int[n];
+        final IntConsumer build = i -> {
+            try {
+                kinds[i] = this.buildGlobalChunkShape(chunks[i]);
+            } catch (final Throwable t) {
+                kinds[i] = -1;
+                Sable.LOGGER.error("[SableJolt] failed to refresh global chunk ({},{},{})", chunks[i].cx, chunks[i].cy, chunks[i].cz, t);
+            }
+        };
+        if (n >= 8) {
+            runParallelIndices(n, build);
+        } else {
+            for (int i = 0; i < n; i++) {
+                build.accept(i);
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            final GlobalChunk chunk = chunks[i];
+            final int kind = kinds[i];
+            if (kind < 0) {
+                continue;
+            }
+            setMember(this.fluidSections, chunk.key, (kind & SECTION_FLUID) != 0);
+            setMember(this.specialSections, chunk.key, (kind & SECTION_SPECIAL) != 0);
+            setMember(this.bouncySections, chunk.key, (kind & SECTION_BOUNCY) != 0);
+            TerrainTile tile = chunk.tile;
+            if (tile == null) {
+                tile = this.tileFor(chunk.cx, chunk.cy, chunk.cz);
+                tile.members.add(chunk);
+                chunk.tile = tile;
+            }
+            this.dirtyTiles.add(tile);
+        }
+    }
 
-        float[] array() {
-            return this.data;
+    private static void setMember(final LongOpenHashSet set, final long key, final boolean member) {
+        if (member) {
+            set.add(key);
+        } else {
+            set.remove(key);
+        }
+    }
+
+    private TerrainTile tileFor(final int cx, final int cy, final int cz) {
+        final int tx = cx >> TILE_SHIFT;
+        final int ty = cy >> TILE_SHIFT;
+        final int tz = cz >> TILE_SHIFT;
+        final long tileKey = ChunkSectionData.packSectionPos(tx, ty, tz);
+        TerrainTile tile = this.terrainTiles.get(tileKey);
+        if (tile == null) {
+            final int rx = (cx + REGION_HALF_SECTIONS) >> REGION_SECTION_SHIFT;
+            final int rz = (cz + REGION_HALF_SECTIONS) >> REGION_SECTION_SHIFT;
+            final long regionKey = ((long) rx << 32) | (rz & 0xFFFFFFFFL);
+            TerrainRegion region = this.terrainRegions.get(regionKey);
+            if (region == null) {
+                region = new TerrainRegion(regionKey, rx, rz);
+                this.terrainRegions.put(regionKey, region);
+            }
+            tile = new TerrainTile(tileKey, region, tx, ty, tz);
+            this.terrainTiles.put(tileKey, tile);
+            region.tiles.add(tile);
+        }
+        return tile;
+    }
+
+    /**
+     * Reassembles the tiles changed since the last step and the regions they
+     * belong to. Runs on the server thread before the native update.
+     */
+    private void flushTerrain() {
+        if (this.dirtyTiles.isEmpty()) {
+            return;
+        }
+        final ReferenceOpenHashSet<TerrainRegion> regions = new ReferenceOpenHashSet<>();
+        for (final TerrainTile tile : this.dirtyTiles) {
+            try {
+                this.assembleTile(tile);
+            } catch (final Throwable t) {
+                Sable.LOGGER.error("[SableJolt] failed to assemble terrain tile ({},{},{})", tile.tx, tile.ty, tile.tz, t);
+            }
+            regions.add(tile.region);
+        }
+        this.dirtyTiles.clear();
+        for (final TerrainRegion region : regions) {
+            try {
+                this.assembleRegion(region);
+            } catch (final Throwable t) {
+                Sable.LOGGER.error("[SableJolt] failed to assemble terrain region ({},{})", region.rx, region.rz, t);
+            }
         }
     }
 
     /**
-     * Creates, updates or removes the static body of a global chunk so that it
-     * matches the chunk's current shape and data.
+     * Builds a tile's compounds from the parts of its sections. A tile without
+     * sections is forgotten.
      */
-    private void refreshGlobalChunkBody(final GlobalChunk chunk) {
-        // Staleness guard: a chunk that was removed can linger in
-        // dirtyGlobalChunks. Its body is already destroyed — touching it again
-        // would double-free in native Jolt.
-        if (this.globalChunks.get(ChunkSectionData.packSectionPos(chunk.cx, chunk.cy, chunk.cz)) != chunk) {
-            return;
+    private void assembleTile(final TerrainTile tile) {
+        if (tile.members.isEmpty()) {
+            this.terrainTiles.remove(tile.key);
+            tile.region.tiles.remove(tile);
         }
-
-        this.buildGlobalChunkShape(chunk);
-        this.ensureGlobalChunkBody(chunk);
+        for (int layer = 0; layer < tile.layers.length; layer++) {
+            this.assembleTileLayer(tile, layer);
+        }
     }
 
-    /**
-     * Creates or updates the static body for the chunk's current shape (built
-     * by {@link #buildGlobalChunkShape}), or removes it when the shape is empty.
-     */
-    private void ensureGlobalChunkBody(final GlobalChunk chunk) {
-        if (chunk.children.length == 0 || chunk.shape == null) {
-            this.destroyGlobalChunkBody(chunk);
-            this.pendingTerrainBodies.remove(chunk);
+    private void assembleTileLayer(final TerrainTile tile, final int layer) {
+        final TileLayer tl = tile.layers[layer];
+        final ObjectArrayList<GlobalChunk> parts = new ObjectArrayList<>(tile.members.size());
+        for (final GlobalChunk chunk : tile.members) {
+            if (chunk.parts[layer].shape != null) {
+                parts.add(chunk);
+            }
+        }
+        tl.ref = null;
+        if (parts.isEmpty()) {
+            tl.shape = null;
+            tl.assembled = new GlobalChunk[0];
             return;
         }
-
-        if (chunk.joltId == 0) {
-            // Keep room for sub-levels: terrain yields first when the world fills up.
-            if (this.system.getNumBodies() >= this.config.maxBodies - this.terrainReserve()) {
-                this.pendingTerrainBodies.add(chunk);
-                this.warnCapacity("terrain section (" + chunk.cx + "," + chunk.cy + "," + chunk.cz + ") is waiting for a free body");
+        // Deterministic sub-shape order.
+        parts.sort((a, b) -> Long.compare(a.key, b.key));
+        final GlobalChunk[] assembled = parts.toArray(new GlobalChunk[0]);
+        final int tileX = tile.tx << (TILE_SHIFT + 4);
+        final int tileY = tile.ty << (TILE_SHIFT + 4);
+        final int tileZ = tile.tz << (TILE_SHIFT + 4);
+        if (assembled.length == 1) {
+            // A static compound of one child would collapse into it.
+            final GlobalChunk only = assembled[0];
+            final Vec3 offset = this.sectionVecScratch.get();
+            offset.set((only.cx << 4) - tileX, (only.cy << 4) - tileY, (only.cz << 4) - tileZ);
+            final MutableCompoundShape single = new MutableCompoundShape();
+            single.addShape(offset, IDENTITY_QUAT, only.parts[layer].shape);
+            tl.shape = single;
+        } else {
+            final StaticCompoundShapeSettings settings = new StaticCompoundShapeSettings();
+            for (final GlobalChunk chunk : assembled) {
+                settings.addShape((chunk.cx << 4) - tileX, (chunk.cy << 4) - tileY, (chunk.cz << 4) - tileZ, chunk.parts[layer].shape);
+            }
+            final ShapeResult result = settings.create();
+            if (result.hasError()) {
+                Sable.LOGGER.error("[SableJolt] terrain tile ({},{},{}) shape failed: {}", tile.tx, tile.ty, tile.tz, result.getError());
+                tl.shape = null;
+                tl.assembled = new GlobalChunk[0];
                 return;
             }
-            final BodyCreationSettings bcs = new BodyCreationSettings(chunk.shape,
-                    chunk.cx << 4, chunk.cy << 4, chunk.cz << 4, 0, 0, 0, 1,
-                    EMotionType.Static,
-                    chunk.special ? LAYER_STATIC_SPECIAL : LAYER_STATIC
-            );
+            tl.ref = result.get();
+            tl.shape = tl.ref.getPtr();
+        }
+        tl.assembled = assembled;
+    }
+
+    /**
+     * Rebuilds a region's compounds from its tiles and installs them on the
+     * region's static bodies (created on first use, destroyed when empty).
+     * Replacing a shape also drops the contact cache of the body, so bodies
+     * resting on changed terrain collide with its new geometry.
+     */
+    private void assembleRegion(final TerrainRegion region) {
+        for (final RegionLayer rl : region.layers) {
+            this.assembleRegionLayer(rl);
+        }
+        if (region.tiles.isEmpty()) {
+            boolean bodies = false;
+            for (final RegionLayer rl : region.layers) {
+                bodies |= rl.body != null;
+            }
+            if (!bodies) {
+                this.terrainRegions.remove(region.key);
+            }
+        }
+    }
+
+    private void assembleRegionLayer(final RegionLayer rl) {
+        final TerrainRegion region = rl.region;
+        final ObjectArrayList<TerrainTile> parts = new ObjectArrayList<>(region.tiles.size());
+        for (final TerrainTile tile : region.tiles) {
+            if (tile.layers[rl.layer].shape != null) {
+                parts.add(tile);
+            }
+        }
+        if (parts.isEmpty()) {
+            this.destroyRegionBody(rl);
+            this.regionsAwaitingBody.remove(rl);
+            return;
+        }
+        final MutableCompoundShape shape = new MutableCompoundShape();
+        final Vec3 offset = this.sectionVecScratch.get();
+        for (final TerrainTile tile : parts) {
+            offset.set((tile.tx << (TILE_SHIFT + 4)) - region.originX, tile.ty << (TILE_SHIFT + 4), (tile.tz << (TILE_SHIFT + 4)) - region.originZ);
+            shape.addShape(offset, IDENTITY_QUAT, tile.layers[rl.layer].shape);
+        }
+        final TerrainTile[] assembled = parts.toArray(new TerrainTile[0]);
+        if (rl.body == null) {
+            final boolean special = rl.layer == TERRAIN_SPECIAL;
+            final BodyCreationSettings bcs = new BodyCreationSettings(shape,
+                    region.originX, 0.0, region.originZ, 0, 0, 0, 1, EMotionType.Static, special ? LAYER_STATIC_SPECIAL : LAYER_STATIC);
             if (this.rapierMode) {
                 bcs.setFriction(FRICTION_TERRAIN_RAPIER);
+            }
+            // Every pair with terrain drops the ghost contacts at block seams.
+            bcs.setEnhancedInternalEdgeRemoval(true);
+            if (special) {
+                // One manifold per block pair: each block applies its own friction,
+                // restitution and callback in the listener.
+                bcs.setUseManifoldReduction(false);
             }
             final Body body;
             try {
                 body = this.bi.createBody(bcs);
             } catch (final IllegalStateException e) {
-                this.pendingTerrainBodies.add(chunk);
-                this.warnCapacity("terrain section (" + chunk.cx + "," + chunk.cy + "," + chunk.cz + ") is waiting for a free body");
+                this.regionsAwaitingBody.add(rl);
+                this.warnCapacity("terrain region (" + region.rx + "," + region.rz + ") is waiting for a free body");
                 return;
             }
+            this.regionsAwaitingBody.remove(rl);
             body.setUserData(-1L);
+            rl.shape = shape;
+            rl.assembled = assembled;
             this.bi.addBody(body, EActivation.DontActivate);
-            chunk.joltId = body.getId();
-            chunk.body = body;
-            chunk.layerSpecial = chunk.special;
-            this.globalChunksByBodyId.put(chunk.joltId, chunk);
-            this.pendingTerrainBodies.remove(chunk);
+            rl.body = body;
+            rl.joltId = body.getId();
+            this.terrainRegionsByBodyId.put(rl.joltId, rl);
         } else {
-            this.bi.setShape(chunk.joltId, chunk.shape, false, EActivation.DontActivate);
-            if (chunk.layerSpecial != chunk.special) {
-                this.bi.setObjectLayer(chunk.joltId, chunk.special ? LAYER_STATIC_SPECIAL : LAYER_STATIC);
-                chunk.layerSpecial = chunk.special;
-            }
+            rl.shape = shape;
+            rl.assembled = assembled;
+            this.bi.setShape(rl.joltId, shape, false, EActivation.DontActivate);
         }
     }
 
-    private int terrainReserve() {
-        return Math.max(1024, this.config.maxBodies / 16);
-    }
+    /**
+     * Region bodies that could not be created (body limit reached); retried.
+     */
+    private final ReferenceOpenHashSet<RegionLayer> regionsAwaitingBody = new ReferenceOpenHashSet<>();
 
-    private void retryPendingTerrain() {
-        if (this.pendingTerrainBodies.isEmpty()) {
+    private void retryRegionBodies() {
+        if (this.regionsAwaitingBody.isEmpty()) {
             return;
         }
-        final int limit = this.config.maxBodies - this.terrainReserve();
-        for (final GlobalChunk chunk : new ObjectArrayList<>(this.pendingTerrainBodies)) {
-            if (this.system.getNumBodies() >= limit) {
-                return;
+        for (final RegionLayer rl : new ObjectArrayList<>(this.regionsAwaitingBody)) {
+            if (this.terrainRegions.get(rl.region.key) != rl.region || rl.body != null) {
+                this.regionsAwaitingBody.remove(rl);
+                continue;
             }
-            // The shape is current (data edits rebuild it via dirtyGlobalChunks).
-            if (this.globalChunks.get(ChunkSectionData.packSectionPos(chunk.cx, chunk.cy, chunk.cz)) == chunk) {
-                this.ensureGlobalChunkBody(chunk);
-            } else {
-                this.pendingTerrainBodies.remove(chunk);
+            this.assembleRegionLayer(rl);
+        }
+    }
+
+    private void destroyRegionBody(final RegionLayer rl) {
+        if (rl.body != null) {
+            this.terrainRegionsByBodyId.remove(rl.joltId);
+            this.bi.removeBody(rl.joltId);
+            this.bi.destroyBody(rl.joltId);
+            rl.body = null;
+            rl.joltId = 0;
+            rl.shape = null;
+            rl.assembled = new TerrainTile[0];
+        }
+    }
+
+    /**
+     * Test support: builds the sub-shape id of every terrain leaf and surface
+     * mesh with Jolt's own id composition and checks that the contact decoding
+     * finds the same leaf.
+     *
+     * @return the number of leaves and meshes decoded wrongly
+     */
+    int verifyTerrainDecoding() {
+        int wrong = 0;
+        for (final TerrainRegion region : this.terrainRegions.values()) {
+            for (final RegionLayer rl : region.layers) {
+                if (rl.shape == null) {
+                    continue;
+                }
+                for (int ti = 0; ti < rl.assembled.length; ti++) {
+                    final TileLayer tl = rl.assembled[ti].layers[rl.layer];
+                    final SubShapeIdCreator tileId = rl.shape.getSubShapeIdFromIndex(ti, new SubShapeIdCreator());
+                    for (int si = 0; si < tl.assembled.length; si++) {
+                        final TerrainPart part = tl.assembled[si].parts[rl.layer];
+                        final SubShapeIdCreator sectionId = tl.assembled.length == 1 ? tileId
+                                : ((CompoundShape) tl.shape).getSubShapeIdFromIndex(si, tileId);
+                        wrong += verifyPart(rl, part, sectionId);
+                    }
+                }
             }
         }
+        return wrong;
+    }
+
+    private static int verifyPart(final RegionLayer rl, final TerrainPart part, final SubShapeIdCreator sectionId) {
+        int wrong = 0;
+        final int meshes = part.meshChildren.length;
+        SubShapeIdCreator boxesId = sectionId;
+        @Nullable ConstShape boxes = part.shape;
+        if (meshes > 0) {
+            if (part.partBits == 0) {
+                return rl.childAt(sectionId.getId()) == part.meshChildren[0] ? 0 : 1;
+            }
+            final CompoundShape compound = (CompoundShape) part.shape;
+            for (int m = 0; m < meshes; m++) {
+                if (rl.childAt(compound.getSubShapeIdFromIndex(m, sectionId).getId()) != part.meshChildren[m]) {
+                    wrong++;
+                }
+            }
+            if (part.children.length == 0) {
+                return wrong;
+            }
+            boxesId = compound.getSubShapeIdFromIndex(meshes, sectionId);
+            boxes = compound.getSubShape(meshes).getShape();
+        }
+        for (int li = 0; li < part.children.length; li++) {
+            final SubShapeIdCreator leafId = part.children.length == 1 ? boxesId
+                    : ((CompoundShape) boxes).getSubShapeIdFromIndex(li, boxesId);
+            if (rl.childAt(leafId.getId()) != part.children[li]) {
+                wrong++;
+            }
+        }
+        return wrong;
+    }
+
+    /**
+     * Collider of the solid terrain block at a world position, or null (air,
+     * fluid, unloaded). Read by the contact listener during the step.
+     */
+    @Nullable
+    JoltVoxelColliderData terrainEntryAt(final int x, final int y, final int z) {
+        final GlobalChunk chunk = this.globalChunks.get(ChunkSectionData.packSectionPos(x >> 4, y >> 4, z >> 4));
+        return chunk == null ? null : this.solidEntry(chunk.data.get(x & 15, y & 15, z & 15));
+    }
+
+    /**
+     * Collider of the solid block of a voxel body at a world position, or null.
+     */
+    @Nullable
+    JoltVoxelColliderData bodyEntryAt(final SableBody body, final double wx, final double wy, final double wz) {
+        final Vector3f r = this.rotateInto((float) (wx - body.snapComX), (float) (wy - body.snapComY), (float) (wz - body.snapComZ),
+                -body.snapQx, -body.snapQy, -body.snapQz, body.snapQw);
+        final int x = floor(body.centerOfMass.x + r.x), y = floor(body.centerOfMass.y + r.y), z = floor(body.centerOfMass.z + r.z);
+        final long key = ChunkSectionData.packSectionPos(x >> 4, y >> 4, z >> 4);
+        final ChunkSectionData data = body.kind == SableBody.Kind.CONTRAPTION ? body.chunks.get(key) : this.allChunks.get(key);
+        return data == null || !body.contains(x, y, z) && body.kind != SableBody.Kind.CONTRAPTION ? null : this.solidEntry(data.get(x & 15, y & 15, z & 15));
+    }
+
+    @Nullable
+    private JoltVoxelColliderData solidEntry(final int packed) {
+        final int colliderId = ChunkSectionData.colliderIdOf(packed);
+        if (colliderId == 0) {
+            return null;
+        }
+        final JoltVoxelColliderData entry = this.colliderRegistry.get(colliderId - 1);
+        return entry == null || entry.isFluid || !entry.hasBoxes() ? null : entry;
+    }
+
+    private static final int NEAR_SPECIAL = 1;
+    private static final int NEAR_BOUNCY = 2;
+
+    /**
+     * Which kinds of special terrain sections a body's bounding sphere
+     * overlaps: blocks with a friction or restitution multiplier
+     * ({@link #NEAR_SPECIAL}), blocks with restitution ({@link #NEAR_BOUNCY}).
+     */
+    private int nearSpecialTerrain(final SableBody sb) {
+        final int any = (this.specialSections.isEmpty() ? 0 : NEAR_SPECIAL) | (this.bouncySections.isEmpty() ? 0 : NEAR_BOUNCY);
+        if (any == 0) {
+            return 0;
+        }
+        final double r = sb.boundRadius + 1.0;
+        final int x0 = floor(sb.snapComX - r) >> 4, x1 = floor(sb.snapComX + r) >> 4;
+        final int y0 = floor(sb.snapComY - r) >> 4, y1 = floor(sb.snapComY + r) >> 4;
+        final int z0 = floor(sb.snapComZ - r) >> 4, z1 = floor(sb.snapComZ + r) >> 4;
+        if ((long) (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) > 512) {
+            return any;
+        }
+        int near = 0;
+        for (int x = x0; x <= x1; x++) {
+            for (int y = y0; y <= y1; y++) {
+                for (int z = z0; z <= z1; z++) {
+                    final long key = ChunkSectionData.packSectionPos(x, y, z);
+                    if (this.specialSections.contains(key)) {
+                        near |= NEAR_SPECIAL;
+                    }
+                    if (this.bouncySections.contains(key)) {
+                        near |= NEAR_BOUNCY;
+                    }
+                    if (near == any) {
+                        return near;
+                    }
+                }
+            }
+        }
+        return near;
+    }
+
+    /**
+     * Test support: number of surface meshes and region bodies per terrain layer.
+     */
+    int[] terrainStats() {
+        int bodiesPlain = 0, bodiesSpecial = 0, meshes = 0;
+        for (final TerrainRegion region : this.terrainRegions.values()) {
+            bodiesPlain += region.layers[TERRAIN_PLAIN].body != null ? 1 : 0;
+            bodiesSpecial += region.layers[TERRAIN_SPECIAL].body != null ? 1 : 0;
+        }
+        for (final GlobalChunk chunk : this.globalChunks.values()) {
+            meshes += chunk.parts[TERRAIN_PLAIN].meshChildren.length;
+        }
+        return new int[]{bodiesPlain, bodiesSpecial, meshes};
     }
 
     private long lastCapacityWarnNanos;
@@ -2944,6 +4303,42 @@ public final class JoltPhysicsScene {
     private long lastUpdateErrorNanos;
 
     /**
+     * Upper bound of Jolt's {@code ContactConstraint}, as far as this allocator is concerned: measured
+     * with jolt-jni 6.1.1 at about 485 bytes. A smaller native struct only leaves the block roomier and a
+     * larger one only brings back the malloc fallback, so this does not have to be exact.
+     */
+    private static final long CONTACT_CONSTRAINT_BYTES = 512L;
+    /**
+     * Everything else an update takes from the allocator: body pairs, islands, solver steps.
+     */
+    private static final long OTHER_TEMP_BYTES = 8L * 1024L * 1024L;
+
+    /**
+     * Size of the fixed temp block. Each update that has an awake body asks for one buffer big enough for
+     * {@code max_contact_constraints}, however few contacts there are: 32 MB at the default. When that
+     * does not fit in the block it comes from malloc, and on a server thread whose malloc arena has other
+     * data in it glibc then builds and tears down a whole heap, with mmap and munmap, in every substep:
+     * 55 microseconds per update, the larger part of what physics cost on a busy server (spark, 2026-11-06).
+     * The block is only reserved address space until it gets used, and only the used part of it is touched.
+     */
+    private static int tempAllocatorBytes(final int maxContactConstraints) {
+        return (int) Math.min(1L << 30, OTHER_TEMP_BYTES + maxContactConstraints * CONTACT_CONSTRAINT_BYTES);
+    }
+
+    /**
+     * Squared speed of one block per substep ({@link #SPEED_SWEPT_BODY_CHILDREN}).
+     */
+    private float sweepSpeedSq = 1600.0f;
+    /**
+     * Length of the current substep (s).
+     */
+    volatile double lastTimeStep = 1.0 / 40.0;
+    /**
+     * Speed bound from which a body reports its contacts (see {@link #REPORT_SPEED}).
+     */
+    private float reportSpeed = REPORT_SPEED;
+
+    /**
      * Steps the simulation by one substep.
      */
     public void step(final double timeStep) {
@@ -2951,12 +4346,17 @@ public final class JoltPhysicsScene {
             return;
         }
         final long stepStartNanos = System.nanoTime();
+        this.sweepSpeedSq = (float) (1.0 / (timeStep * timeStep));
+        this.lastTimeStep = timeStep;
+        // A body hitting the world reports from 25 * dt m/s (see report).
+        this.reportSpeed = (float) Math.min(REPORT_SPEED, 0.9 * 25.0 * timeStep);
         this.flushDirty();
         if (this.rapierMode) {
             this.applyTickBuoyancy();
         } else {
             this.computeBuoyancy();
         }
+        this.applyJointDampers(timeStep);
         this.updateContraptionMotion((float) timeStep);
         // small scenes: a single-threaded job system avoids the wake/sync overhead
         // of the thread pool, which dominates when the solver has almost no work.
@@ -2965,6 +4365,7 @@ public final class JoltPhysicsScene {
         // The flag is maintained by refreshBodySnapshot (one tick stale at most).
         final boolean heavyBody = this.snapshotHeavyBody;
         final JobSystem jobs = this.bodyList.size() >= MULTITHREAD_BODY_THRESHOLD || heavyBody
+                || this.snapshotAwakeLeaves >= PARALLEL_AWAKE_LEAVES
                 ? this.jobSystem : this.singleThreadJobSystem;
 
         // Adaptive solver depth (Jolt mode): a huge compound body resting on the
@@ -3069,6 +4470,7 @@ public final class JoltPhysicsScene {
      * dedicated scan (one tick stale at most — a pure performance heuristic).
      */
     private boolean snapshotHeavyBody;
+    private int snapshotAwakeLeaves;
 
     /**
      * Native list of the awake bodies, filled by Jolt every step.
@@ -3185,9 +4587,12 @@ public final class JoltPhysicsScene {
         }
 
         // Contact routing for the next step (only bodies that changed this step).
+        int awakeLeaves = 0;
         for (final SableBody sb : awake) {
             this.classifyLayer(sb);
+            awakeLeaves += sb.leafCount;
         }
+        this.snapshotAwakeLeaves = awakeLeaves;
         for (final SableBody sb : extras) {
             if (!sb.snapActive) {
                 this.classifyLayer(sb);
@@ -3213,19 +4618,26 @@ public final class JoltPhysicsScene {
     }
 
     /**
-     * Report layer for bodies whose contacts need Java (special blocks,
-     * mounted contraptions, creative drag) or that move fast enough for an
-     * impact report (linear speed plus spin times the body radius).
+     * Report layer for bodies whose contacts need Java (special blocks of their
+     * own or of the terrain they overlap, mounted contraptions, creative drag)
+     * or that move fast enough for an impact report (linear speed plus spin
+     * times the body radius). Contacts with terrain blocks that have a contact
+     * callback reach Java through that terrain body's own layer.
      */
     private void classifyLayer(final SableBody sb) {
         if (sb.body == null || sb.layer == LAYER_ROPE) {
             return;
         }
+        final int near = sb.snapActive ? this.nearSpecialTerrain(sb) : 0;
+        sb.nearSpecial = (near & NEAR_SPECIAL) != 0;
+        sb.nearBouncy = (near & NEAR_BOUNCY) != 0;
         final int desired;
         if (sb.layerSpecial || this.creativeDragBodies.contains(sb.joltId)) {
             desired = LAYER_MOVING_REPORT;
         } else if (!sb.snapActive) {
             desired = LAYER_MOVING;
+        } else if (sb.nearSpecial) {
+            desired = LAYER_MOVING_REPORT;
         } else {
             final float v = (float) Math.sqrt(sb.snapVx * sb.snapVx + sb.snapVy * sb.snapVy + sb.snapVz * sb.snapVz);
             final float w = (float) Math.sqrt(sb.snapAx * sb.snapAx + sb.snapAy * sb.snapAy + sb.snapAz * sb.snapAz);
@@ -3233,9 +4645,9 @@ public final class JoltPhysicsScene {
             // Hysteresis: a layer change re-files the body in the broad phase,
             // so bodies hovering around the threshold must not switch every step.
             if (sb.layer == LAYER_MOVING_REPORT) {
-                desired = bound >= REPORT_SPEED * 0.6f ? LAYER_MOVING_REPORT : LAYER_MOVING;
+                desired = bound >= this.reportSpeed * 0.6f ? LAYER_MOVING_REPORT : LAYER_MOVING;
             } else {
-                desired = bound >= REPORT_SPEED ? LAYER_MOVING_REPORT : LAYER_MOVING;
+                desired = bound >= this.reportSpeed ? LAYER_MOVING_REPORT : LAYER_MOVING;
             }
         }
         this.setBodyLayer(sb, desired);
@@ -3320,6 +4732,7 @@ public final class JoltPhysicsScene {
                 this.bi.setLinearVelocity(sb.joltId, vx, vy, vz);
             }
         }
+        this.updateMotionQuality(sb, heavy, vx, vy, vz);
         sb.snapVx = vx;
         sb.snapVy = vy;
         sb.snapVz = vz;
@@ -3327,6 +4740,46 @@ public final class JoltPhysicsScene {
         sb.snapAy = ay;
         sb.snapAz = az;
         return heavy && sb.snapActive;
+    }
+
+    /**
+     * Speed along gravity (m/s) from which a body sweeps (LinearCast). Slower
+     * vertical motion stays within the speculative contact distance per substep.
+     */
+    private static final float SWEEP_VERTICAL_SPEED = 1.0f;
+
+    /**
+     * Chooses between swept (LinearCast) and discrete motion for the next step.
+     * A body only sweeps while it moves along gravity: falling, landing or
+     * bouncing. A sweep casts the body along its whole motion, and a body that
+     * slides on the ground rests a little inside it, so the cast stops it at the
+     * side of the next block of every seam and launches it (Rapier has no
+     * working CCD against voxels at all: its voxel shape does not support
+     * casts). Bodies sliding or flying level move discretely, as in Rapier.
+     * Large bodies additionally only sweep while faster than one block per
+     * substep (casting a whole compound is expensive), huge ones never.
+     * Bodies that can bounce (blocks with restitution of their own or in the
+     * terrain around them) never sweep either: a swept body's impact is
+     * resolved at the single point its cast hit, so a flat landing on a
+     * bouncy block would spin the body; the discrete contacts bounce it from
+     * its whole contact face.
+     */
+    private void updateMotionQuality(final SableBody sb, final boolean heavy, final float vx, final float vy, final float vz) {
+        if (sb.kind != SableBody.Kind.SUB_LEVEL && sb.kind != SableBody.Kind.BOX) {
+            return;
+        }
+        boolean sweep = false;
+        if (!heavy && !sb.bouncy && !sb.nearBouncy) {
+            final double along = this.hasGravity
+                    ? Math.abs(vx * this.gravityDirX + vy * this.gravityDirY + vz * this.gravityDirZ)
+                    : Double.MAX_VALUE;
+            sweep = along >= SWEEP_VERTICAL_SPEED
+                    && (sb.leafCount < SPEED_SWEPT_BODY_CHILDREN || vx * vx + vy * vy + vz * vz > this.sweepSpeedSq);
+        }
+        if (sweep != sb.sweeping) {
+            sb.sweeping = sweep;
+            this.bi.setMotionQuality(sb.joltId, sweep ? EMotionQuality.LinearCast : EMotionQuality.Discrete);
+        }
     }
 
     private long lastPoisonLogNanos;
@@ -3491,16 +4944,23 @@ public final class JoltPhysicsScene {
         this.contraptionList.clear();
         this.pendingCreation.clear();
         this.globalChunks.clear();
-        this.globalChunksByBodyId.clear();
+        this.terrainRegions.clear();
+        this.terrainRegionsByBodyId.clear();
+        this.terrainTiles.clear();
+        this.dirtyTiles.clear();
+        this.specialSections.clear();
+        this.bouncySections.clear();
+        this.meshedSections.clear();
+        this.regionsAwaitingBody.clear();
         this.allChunks.clear();
         this.sectionOwners.clear();
         this.joints.clear();
+        this.damperJoints.clear();
         this.ropes.clear();
         synchronized (this.dirtyBodies) {
             this.dirtyBodies.clear();
         }
         this.dirtyGlobalChunks.clear();
-        this.pendingTerrainBodies.clear();
         this.fluidSections.clear();
         this.angularFollowPrev.clear();
         this.angularCachedOmega.clear();
@@ -4057,9 +5517,6 @@ public final class JoltPhysicsScene {
         return this.colliderRegistry;
     }
 
-    GlobalChunk globalChunkByBodyId(final int joltId) {
-        return this.globalChunksByBodyId.get(joltId);
-    }
 
     //endregion
 
@@ -4200,9 +5657,167 @@ public final class JoltPhysicsScene {
         }
         this.countAttachment(rec.joltIdA, -1);
         this.countAttachment(rec.joltIdB, -1);
+        if (rec.damper) {
+            this.damperJoints.remove(rec);
+        }
         if (rec.constraint != null) {
             this.removeConstraint(rec.constraint);
             rec.constraint = null;
+        }
+    }
+
+    private final ObjectArrayList<JointRecord> damperJoints = new ObjectArrayList<>();
+    private final DamperSide damperA = new DamperSide();
+    private final DamperSide damperB = new DamperSide();
+    private final Vector3d damperAxis = new Vector3d();
+    private final Vector3d damperArm = new Vector3d();
+
+    /**
+     * Makes a joint a viscous damper. Every caller passes one value for all linear
+     * axes and one for all angular axes, so one coefficient per group is enough.
+     */
+    public void setJointDamping(final JointRecord rec, final boolean linear, final double damping) {
+        if (!rec.damper) {
+            rec.damper = true;
+            this.damperJoints.add(rec);
+        }
+        if (linear) {
+            rec.linearDamping = damping;
+        } else {
+            rec.angularDamping = damping;
+        }
+    }
+
+    /**
+     * Applies drag between the two anchors of each damper joint, as forces for the
+     * coming substep: dv/dt = -c * v on the relative velocity, independent of mass
+     * (the behaviour of Rapier's acceleration-based motors), integrated implicitly
+     * so a large coefficient cannot overshoot. Sleeping bodies are not touched:
+     * forces on them would pile up until they wake.
+     */
+    private void applyJointDampers(final double dt) {
+        for (int i = 0; i < this.damperJoints.size(); i++) {
+            final JointRecord rec = this.damperJoints.get(i);
+            final SableBody sbA = this.bodiesByJoltId.get(rec.joltIdA);
+            final SableBody sbB = this.bodiesByJoltId.get(rec.joltIdB);
+            if (!(rec.genericSettings instanceof final SixDofConstraintSettings settings)) {
+                continue;
+            }
+            final DamperSide a = this.damperA.load(sbA, settings.getPosition1());
+            final DamperSide b = this.damperB.load(sbB, settings.getPosition2());
+            if (!a.driven && !b.driven) {
+                continue;
+            }
+
+            // Linear: relative velocity of the anchors, along its own direction.
+            final double vx = b.vx + b.wy * b.rz - b.wz * b.ry - (a.vx + a.wy * a.rz - a.wz * a.ry);
+            final double vy = b.vy + b.wz * b.rx - b.wx * b.rz - (a.vy + a.wz * a.rx - a.wx * a.rz);
+            final double vz = b.vz + b.wx * b.ry - b.wy * b.rx - (a.vz + a.wx * a.ry - a.wy * a.rx);
+            final double speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+            if (rec.linearDamping > 0.0 && speed > 1.0e-5) {
+                final Vector3d n = this.damperAxis.set(vx / speed, vy / speed, vz / speed);
+                final double k = a.inverseMassAt(n, this.damperArm) + b.inverseMassAt(n, this.damperArm);
+                if (k > 1.0e-12) {
+                    final double force = rec.linearDamping * dt / (1.0 + rec.linearDamping * dt) * speed / k / dt;
+                    a.pushAtAnchor(force * n.x, force * n.y, force * n.z);
+                    b.pushAtAnchor(-force * n.x, -force * n.y, -force * n.z);
+                }
+            }
+
+            // Angular: relative spin, along its own axis.
+            final double ox = b.wx - a.wx;
+            final double oy = b.wy - a.wy;
+            final double oz = b.wz - a.wz;
+            final double spin = Math.sqrt(ox * ox + oy * oy + oz * oz);
+            if (rec.angularDamping > 0.0 && spin > 1.0e-5) {
+                final Vector3d n = this.damperAxis.set(ox / spin, oy / spin, oz / spin);
+                final double k = a.inverseInertiaAlong(n) + b.inverseInertiaAlong(n);
+                if (k > 1.0e-12) {
+                    final double torque = rec.angularDamping * dt / (1.0 + rec.angularDamping * dt) * spin / k / dt;
+                    a.twist(torque * n.x, torque * n.y, torque * n.z);
+                    b.twist(-torque * n.x, -torque * n.y, -torque * n.z);
+                }
+            }
+        }
+    }
+
+    /** One side of a damper joint, read fresh for each substep. The static world reads as all zeros. */
+    private static final class DamperSide {
+        private final Vec3 vec = new Vec3();
+        private final Quat rotation = new Quat();
+        private final Quat inertiaRotation = new Quat();
+        private final Quaterniond toPrincipal = new Quaterniond();
+        private final Vector3d principal = new Vector3d();
+        private Body body;
+        /** Awake and dynamic: forces apply. Otherwise it only contributes its velocity. */
+        boolean driven;
+        double rx, ry, rz, vx, vy, vz, wx, wy, wz;
+        private double inverseMass, ix, iy, iz;
+
+        DamperSide load(@Nullable final SableBody sb, final RVec3 localAnchor) {
+            this.driven = false;
+            this.rx = this.ry = this.rz = this.vx = this.vy = this.vz = this.wx = this.wy = this.wz = 0.0;
+            this.body = sb == null ? null : sb.body;
+            if (this.body == null) {
+                return this;
+            }
+            this.body.getLinearVelocity(this.vec);
+            this.vx = this.vec.getX();
+            this.vy = this.vec.getY();
+            this.vz = this.vec.getZ();
+            this.body.getAngularVelocity(this.vec);
+            this.wx = this.vec.getX();
+            this.wy = this.vec.getY();
+            this.wz = this.vec.getZ();
+            this.body.getRotation(this.rotation);
+            final Vector3d r = this.toPrincipal.set(this.rotation.getX(), this.rotation.getY(), this.rotation.getZ(), this.rotation.getW())
+                    .transform(this.principal.set(localAnchor.xx(), localAnchor.yy(), localAnchor.zz()));
+            this.rx = r.x;
+            this.ry = r.y;
+            this.rz = r.z;
+            this.driven = this.body.isDynamic() && this.body.isActive();
+            if (this.driven) {
+                final var motion = this.body.getMotionProperties();
+                this.inverseMass = motion.getInverseMass();
+                motion.getInverseInertiaDiagonal(this.vec);
+                this.ix = this.vec.getX();
+                this.iy = this.vec.getY();
+                this.iz = this.vec.getZ();
+                motion.getInertiaRotation(this.inertiaRotation);
+                // World to principal axes: (body rotation * inertia rotation)^-1.
+                this.toPrincipal.mul(this.inertiaRotation.getX(), this.inertiaRotation.getY(), this.inertiaRotation.getZ(), this.inertiaRotation.getW()).conjugate();
+            }
+            return this;
+        }
+
+        double inverseInertiaAlong(final Vector3d axis) {
+            if (!this.driven) {
+                return 0.0;
+            }
+            final Vector3d p = this.toPrincipal.transform(this.principal.set(axis));
+            return p.x * p.x * this.ix + p.y * p.y * this.iy + p.z * p.z * this.iz;
+        }
+
+        /** 1 / effective mass of the anchor along a direction. */
+        double inverseMassAt(final Vector3d direction, final Vector3d arm) {
+            if (!this.driven) {
+                return 0.0;
+            }
+            arm.set(this.ry * direction.z - this.rz * direction.y, this.rz * direction.x - this.rx * direction.z, this.rx * direction.y - this.ry * direction.x);
+            return this.inverseMass + this.inverseInertiaAlong(arm);
+        }
+
+        void pushAtAnchor(final double fx, final double fy, final double fz) {
+            if (this.driven && Double.isFinite(fx + fy + fz)) {
+                this.body.addForce((float) fx, (float) fy, (float) fz);
+                this.body.addTorque((float) (this.ry * fz - this.rz * fy), (float) (this.rz * fx - this.rx * fz), (float) (this.rx * fy - this.ry * fx));
+            }
+        }
+
+        void twist(final double tx, final double ty, final double tz) {
+            if (this.driven && Double.isFinite(tx + ty + tz)) {
+                this.body.addTorque((float) tx, (float) ty, (float) tz);
+            }
         }
     }
 
@@ -4260,9 +5875,9 @@ public final class JoltPhysicsScene {
         bcs.setLinearDamping((float) (this.universalDrag + 6.0));
         bcs.setAngularDamping((float) this.universalDrag);
         bcs.setInertiaMultiplier(0.0f);
-        // Rapier averages frictions; Jolt multiplies them under a square root. 0.214
-        // reproduces Rapier's rope (0.15) contacts with sub-levels and terrain.
-        bcs.setFriction(this.rapierMode ? 0.214f : FRICTION_ROPE);
+        // Rapier's rope friction; the scene combines frictions as Rapier does in
+        // Rapier-compatible mode (average).
+        bcs.setFriction(FRICTION_ROPE);
         final MassProperties mp = new MassProperties();
         mp.setMass(0.35f);
         bcs.setOverrideMassProperties(EOverrideMassProperties.CalculateInertia);
@@ -4589,8 +6204,8 @@ public final class JoltPhysicsScene {
 
             final SableBody sb1 = scene.bodiesByJoltId.get(id1);
             final SableBody sb2 = scene.bodiesByJoltId.get(id2);
-            final GlobalChunk gc1 = sb1 == null ? scene.globalChunksByBodyId.get(id1) : null;
-            final GlobalChunk gc2 = sb2 == null ? scene.globalChunksByBodyId.get(id2) : null;
+            final RegionLayer gc1 = sb1 == null ? scene.terrainRegionsByBodyId.get(id1) : null;
+            final RegionLayer gc2 = sb2 == null ? scene.terrainRegionsByBodyId.get(id2) : null;
 
             if (sb1 == null && sb2 == null && gc1 == null && gc2 == null) {
                 return;
@@ -4616,20 +6231,37 @@ public final class JoltPhysicsScene {
             final JoltVoxelColliderData entry2 = c2 != null ? scene.colliderRegistry.get(c2.colliderId - 1) : null;
 
             // friction / restitution overrides (block-level)
-            final float mult1 = entry1 == null ? 1.0f : entry1.frictionMultiplier;
-            final float mult2 = entry2 == null ? 1.0f : entry2.frictionMultiplier;
+            float mult = (entry1 == null ? 1.0f : entry1.frictionMultiplier) * (entry2 == null ? 1.0f : entry2.frictionMultiplier);
+            float restitution = Math.max(entry1 == null ? 0.0f : entry1.restitution, entry2 == null ? 0.0f : entry2.restitution);
+            // One manifold here can span blocks of different kinds (Jolt merges
+            // the contacts of a body pair that share a normal): sample the block
+            // pairs instead when either side may mix them.
+            final boolean special1 = gc1 != null && gc1.layer == TERRAIN_SPECIAL, special2 = gc2 != null && gc2.layer == TERRAIN_SPECIAL;
+            if (!special1 && !special2) {
+                final SableBody driver = sb1 != null && sb1.body != null && sb1.kind != SableBody.Kind.BOX ? sb1
+                        : sb2 != null && sb2.body != null && sb2.kind != SableBody.Kind.BOX ? sb2 : null;
+                final SableBody other = driver == sb1 ? sb2 : sb1;
+                final boolean terrain = gc1 != null || gc2 != null;
+                if (driver != null && (driver.layerSpecial || (terrain && driver.nearSpecial) || (other != null && other.layerSpecial))) {
+                    final Vec3 n = manifold.getWorldSpaceNormal();
+                    final float sign = driver == sb1 ? 1.0f : -1.0f;
+                    final float[] sampled = this.sampleScratch.get();
+                    if (this.sampleBlockPairs(driver, terrain ? null : other, terrain, sign * n.getX(), sign * n.getY(), sign * n.getZ(), sampled)) {
+                        mult = sampled[0];
+                        restitution = sampled[1];
+                    }
+                }
+            }
             if (scene.rapierMode) {
                 // Rapier: average of the collider frictions times both multipliers.
                 final float f1 = frictionOf(sb1, gc1, c1);
                 final float f2 = frictionOf(sb2, gc2, c2);
-                settings.setCombinedFriction((f1 + f2) * 0.5f * mult1 * mult2);
-            } else if (mult1 != 1.0f || mult2 != 1.0f) {
-                settings.setCombinedFriction(settings.getCombinedFriction() * mult1 * mult2);
+                settings.setCombinedFriction((f1 + f2) * 0.5f * mult);
+            } else if (mult != 1.0f) {
+                settings.setCombinedFriction(settings.getCombinedFriction() * mult);
             }
-            final float rest1 = entry1 == null ? 0.0f : entry1.restitution;
-            final float rest2 = entry2 == null ? 0.0f : entry2.restitution;
-            if (rest1 > 0.0f || rest2 > 0.0f) {
-                settings.setCombinedRestitution(Math.max(rest1, rest2));
+            if (restitution > 0.0f) {
+                settings.setCombinedRestitution(restitution);
             }
 
             // Mounted contraption blocks move relative to their mount's body:
@@ -4665,7 +6297,88 @@ public final class JoltPhysicsScene {
             return c != null && c.owner != null && c.owner.kind == SableBody.Kind.CONTRAPTION;
         }
 
-        private static float frictionOf(@Nullable final SableBody sb, @Nullable final GlobalChunk gc, @Nullable final Child c) {
+        private final ThreadLocal<float[]> sampleScratch = ThreadLocal.withInitial(() -> new float[2]);
+
+        /**
+         * Support blocks of a contact: within this distance (blocks) of the
+         * deepest corner block along the normal.
+         */
+        private static final double SUPPORT_TOLERANCE = 0.05;
+        private static final int MAX_SAMPLES = 32;
+
+        /**
+         * Friction multiplier and restitution of a contact taken per block pair,
+         * as Rapier's hooks do per voxel pair (hooks.rs): the corner blocks of
+         * {@code driver}'s leaves deepest along the contact normal (on a flat
+         * contact the corners of its contact face, the only blocks Rapier's
+         * neighbourhood culling keeps there) against the solid block right
+         * beyond each of them on the other side.
+         *
+         * @param other  the other voxel body, null for the terrain
+         * @param dx     contact normal from {@code driver} towards the other side
+         * @param out    receives the mean of the friction multiplier products and
+         *               the mean of the restitutions
+         * @return false when no pair of solid blocks was found
+         */
+        private boolean sampleBlockPairs(final SableBody driver, @Nullable final SableBody other, final boolean terrain,
+                                         final float dx, final float dy, final float dz, final float[] out) {
+            final JoltPhysicsScene scene = JoltPhysicsScene.this;
+            final ObjectArrayList<Child> leaves = driver.children;
+            final int count = leaves.size();
+            if (count == 0 || count > 4096 || (!terrain && (other == null || other.body == null))) {
+                return false;
+            }
+            final Vector3f dl = scene.rotateInto(dx, dy, dz, -driver.snapQx, -driver.snapQy, -driver.snapQz, driver.snapQw);
+            final double lx = dl.x, ly = dl.y, lz = dl.z;
+            final double comX = driver.centerOfMass.x, comY = driver.centerOfMass.y, comZ = driver.centerOfMass.z;
+            final Object[] elements = leaves.elements();
+            double deepest = Double.NEGATIVE_INFINITY;
+            for (int i = 0; i < count; i++) {
+                final Child c = (Child) elements[i];
+                final double px = (lx >= 0.0 ? c.ex : c.bx) + 0.5 - comX;
+                final double py = (ly >= 0.0 ? c.ey : c.by) + 0.5 - comY;
+                final double pz = (lz >= 0.0 ? c.ez : c.bz) + 0.5 - comZ;
+                deepest = Math.max(deepest, px * lx + py * ly + pz * lz);
+            }
+            final double limit = deepest - SUPPORT_TOLERANCE;
+            double multSum = 0.0, restSum = 0.0;
+            int samples = 0;
+            for (int i = 0; i < count && samples < MAX_SAMPLES; i++) {
+                final Child c = (Child) elements[i];
+                final JoltVoxelColliderData own = scene.colliderRegistry.get(c.colliderId - 1);
+                for (int corner = 0; corner < 8 && samples < MAX_SAMPLES; corner++) {
+                    final int bx = (corner & 1) == 0 ? c.bx : c.ex;
+                    final int by = (corner & 2) == 0 ? c.by : c.ey;
+                    final int bz = (corner & 4) == 0 ? c.bz : c.ez;
+                    // the same block twice when the leaf is one block thick along an axis
+                    if (((corner & 1) != 0 && c.ex == c.bx) || ((corner & 2) != 0 && c.ey == c.by) || ((corner & 4) != 0 && c.ez == c.bz)) {
+                        continue;
+                    }
+                    final double px = bx + 0.5 - comX, py = by + 0.5 - comY, pz = bz + 0.5 - comZ;
+                    if (px * lx + py * ly + pz * lz < limit) {
+                        continue;
+                    }
+                    final Vector3f w = scene.rotateInto((float) px, (float) py, (float) pz, driver.snapQx, driver.snapQy, driver.snapQz, driver.snapQw);
+                    // From the block center past its face into whatever it touches.
+                    final double wx = driver.snapComX + w.x + dx * 0.8, wy = driver.snapComY + w.y + dy * 0.8, wz = driver.snapComZ + w.z + dz * 0.8;
+                    final JoltVoxelColliderData beyond = terrain ? scene.terrainEntryAt(floor(wx), floor(wy), floor(wz)) : scene.bodyEntryAt(other, wx, wy, wz);
+                    if (beyond == null) {
+                        continue;
+                    }
+                    multSum += (own == null ? 1.0f : own.frictionMultiplier) * beyond.frictionMultiplier;
+                    restSum += Math.max(own == null ? 0.0f : own.restitution, beyond.restitution);
+                    samples++;
+                }
+            }
+            if (samples == 0) {
+                return false;
+            }
+            out[0] = (float) (multSum / samples);
+            out[1] = (float) (restSum / samples);
+            return true;
+        }
+
+        private static float frictionOf(@Nullable final SableBody sb, @Nullable final RegionLayer gc, @Nullable final Child c) {
             if (gc != null) {
                 return FRICTION_TERRAIN_RAPIER;
             }
@@ -4809,10 +6522,18 @@ public final class JoltPhysicsScene {
             final boolean hasOther = other != null;
             if (other != null) {
                 if (otherIsTerrain) {
-                    // merged terrain slabs: derive the touched block from the point
+                    // merged terrain boxes: derive the touched block from the point
                     ox = floor(px + dirX * 0.25);
                     oy = floor(py + dirY * 0.25);
                     oz = floor(pz + dirZ * 0.25);
+                } else if (other.merged() && other.owner != null && other.owner.kind == SableBody.Kind.SUB_LEVEL) {
+                    // the block of a merged box closest to the contact point
+                    final SableBody owner = other.owner;
+                    final Vector3f r = scene.rotateInto((float) (px + dirX * 0.25 - owner.snapComX), (float) (py + dirY * 0.25 - owner.snapComY),
+                            (float) (pz + dirZ * 0.25 - owner.snapComZ), -owner.snapQx, -owner.snapQy, -owner.snapQz, owner.snapQw);
+                    ox = other.nearestX(owner.centerOfMass.x + r.x);
+                    oy = other.nearestY(owner.centerOfMass.y + r.y);
+                    oz = other.nearestZ(owner.centerOfMass.z + r.z);
                 } else {
                     ox = other.bx;
                     oy = other.by;
@@ -4835,10 +6556,10 @@ public final class JoltPhysicsScene {
             if (contraption.linVel.lengthSquared() == 0.0 && contraption.angVel.lengthSquared() == 0.0) {
                 return;
             }
-            // local velocity at the block: v + w x r (contraption frame)
-            final double rx = c.bx + 0.5 - contraption.centerOfMass.x;
-            final double ry = c.by + 0.5 - contraption.centerOfMass.y;
-            final double rz = c.bz + 0.5 - contraption.centerOfMass.z;
+            // local velocity at the block (center of a merged box): v + w x r (contraption frame)
+            final double rx = (c.bx + c.ex) * 0.5 + 0.5 - contraption.centerOfMass.x;
+            final double ry = (c.by + c.ey) * 0.5 + 0.5 - contraption.centerOfMass.y;
+            final double rz = (c.bz + c.ez) * 0.5 + 0.5 - contraption.centerOfMass.z;
             final Vector3d w = contraption.angVel;
             final double lvx = contraption.linVel.x + w.y * rz - w.z * ry;
             final double lvy = contraption.linVel.y + w.z * rx - w.x * rz;
@@ -4860,6 +6581,42 @@ public final class JoltPhysicsScene {
             settings.setRelativeLinearSurfaceVelocity(combined);
         }
 
+        private final ThreadLocal<double[]> blockScratch = ThreadLocal.withInitial(() -> new double[3]);
+
+        /**
+         * The block of a leaf touching the other body: the leaf's own block, or
+         * for a merged box the block closest to a point one body radius from the
+         * center of mass towards the other body.
+         *
+         * @param dirX direction from {@code self} towards the other body (world)
+         */
+        private double[] contactBlock(final Child c, final SableBody self, @Nullable final SableBody other,
+                                      final double dirX, final double dirY, final double dirZ) {
+            final double[] out = this.blockScratch.get();
+            if (!c.merged()) {
+                out[0] = c.bx;
+                out[1] = c.by;
+                out[2] = c.bz;
+                return out;
+            }
+            final JoltPhysicsScene scene = JoltPhysicsScene.this;
+            double tx, ty, tz;
+            if (other != null && other.body != null) {
+                tx = other.snapComX - self.snapComX;
+                ty = other.snapComY - self.snapComY;
+                tz = other.snapComZ - self.snapComZ;
+            } else {
+                tx = dirX * self.boundRadius;
+                ty = dirY * self.boundRadius;
+                tz = dirZ * self.boundRadius;
+            }
+            final Vector3f r = scene.rotateInto((float) tx, (float) ty, (float) tz, -self.snapQx, -self.snapQy, -self.snapQz, self.snapQw);
+            out[0] = c.nearestX(self.centerOfMass.x + r.x);
+            out[1] = c.nearestY(self.centerOfMass.y + r.y);
+            out[2] = c.nearestZ(self.centerOfMass.z + r.z);
+            return out;
+        }
+
         private void report(@Nullable final SableBody sb1, @Nullable final SableBody sb2, @Nullable final Child c1, @Nullable final Child c2,
                             final Body body1, final Body body2, final double nx, final double ny, final double nz) {
             // No collision damage while god-dragging.
@@ -4869,14 +6626,16 @@ public final class JoltPhysicsScene {
             }
             final JoltPhysicsScene scene = JoltPhysicsScene.this;
 
-            // contact point approximated by the involved block center (body-local, relative to the COM)
+            // contact point approximated by the involved block center (body-local,
+            // relative to the COM); for a merged box, its block facing the other body
             double px1 = 0, py1 = 0, pz1 = 0;
             double px2 = 0, py2 = 0, pz2 = 0;
             double wx1, wy1, wz1;
             if (c1 != null && sb1 != null && c1.owner == sb1) {
-                px1 = c1.bx + 0.5 - sb1.centerOfMass.x;
-                py1 = c1.by + 0.5 - sb1.centerOfMass.y;
-                pz1 = c1.bz + 0.5 - sb1.centerOfMass.z;
+                final double[] b = this.contactBlock(c1, sb1, sb2, nx, ny, nz);
+                px1 = b[0] + 0.5 - sb1.centerOfMass.x;
+                py1 = b[1] + 0.5 - sb1.centerOfMass.y;
+                pz1 = b[2] + 0.5 - sb1.centerOfMass.z;
                 final Vector3f r = scene.rotateInto((float) px1, (float) py1, (float) pz1, sb1.snapQx, sb1.snapQy, sb1.snapQz, sb1.snapQw);
                 wx1 = sb1.snapComX + r.x;
                 wy1 = sb1.snapComY + r.y;
@@ -4889,26 +6648,30 @@ public final class JoltPhysicsScene {
                 return; // body 1 is always the moving one
             }
             if (c2 != null && sb2 != null && c2.owner == sb2) {
-                px2 = c2.bx + 0.5 - sb2.centerOfMass.x;
-                py2 = c2.by + 0.5 - sb2.centerOfMass.y;
-                pz2 = c2.bz + 0.5 - sb2.centerOfMass.z;
+                final double[] b = this.contactBlock(c2, sb2, sb1, -nx, -ny, -nz);
+                px2 = b[0] + 0.5 - sb2.centerOfMass.x;
+                py2 = b[1] + 0.5 - sb2.centerOfMass.y;
+                pz2 = b[2] + 0.5 - sb2.centerOfMass.z;
             }
 
             final double[] v = this.velScratch.get();
             velocityAt(sb1, wx1, wy1, wz1, v, 0);
             velocityAt(sb2, wx1, wy1, wz1, v, 3);
             final double rvx = v[0] - v[3], rvy = v[1] - v[4], rvz = v[2] - v[5];
-            // Cheap reject: below this relative speed no record can pass the
-            // pipeline's 25 * minMass force threshold.
-            if (rvx * rvx + rvy * rvy + rvz * rvz < 1.5625) {
+            // Rapier reports the contact force of the substep (event_handler.rs):
+            // the impulse that stops the approach divided by the substep. The
+            // pipeline's 25 * minMass threshold then needs a normal speed of
+            // 25 * dt (0.625 m/s at 2 substeps); slower contacts are rejected here.
+            final double dt = scene.lastTimeStep;
+            final double minSpeed = 25.0 * dt;
+            if (rvx * rvx + rvy * rvy + rvz * rvz < minSpeed * minSpeed) {
                 return;
             }
             final double relSpeed = Math.abs(rvx * nx + rvy * ny + rvz * nz);
             final float invM1 = body1.isDynamic() ? body1.getMotionProperties().getInverseMass() : 0.0f;
             final float invM2 = body2.isDynamic() ? body2.getMotionProperties().getInverseMass() : 0.0f;
             final double effMass = (invM1 + invM2) > 1.0e-9f ? 1.0 / (invM1 + invM2) : 0.0;
-            // force estimate: normal speed * effective mass * tick rate
-            final double force = relSpeed * effMass * 20.0;
+            final double force = relSpeed * effMass / dt;
             final double m1 = invM1 > 0.0f ? 1.0 / invM1 : Double.MAX_VALUE;
             final double m2 = invM2 > 0.0f ? 1.0 / invM2 : Double.MAX_VALUE;
             if (!(force > 25.0 * Math.min(m1, m2))) {

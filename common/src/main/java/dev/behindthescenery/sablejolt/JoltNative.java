@@ -9,11 +9,8 @@ import org.jetbrains.annotations.ApiStatus;
 
 import java.io.FileNotFoundException;
 import java.io.InputStream;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.Locale;
 
 /**
@@ -93,21 +90,13 @@ public final class JoltNative {
                 }
                 bytes = is.readAllBytes();
             }
-            // Version the target directory with a content hash of the library:
-            // two jars in the mods folder must never fight over one file, and a
-            // System.load of the SAME path already loaded earlier in this JVM
-            // process would silently return the OLD library (Windows reuses the
-            // module by path) — the actual cause of "missing native symbol"
-            // errors after a jolt-jni upgrade.
-            final Path dir = NATIVE_DIR.resolve(ShortHash.of(bytes)).normalize();
-            Files.createDirectories(dir);
-            final Path target = dir.resolve(fileName);
-            // Skip the write when the file from a previous run is still there
-            // (a running game process keeps the DLL locked on Windows).
-            if (!Files.exists(target) || Files.size(target) != bytes.length) {
-                Files.write(target, bytes);
-            }
-            System.load(target.toAbsolutePath().toString());
+            // The installer versions the target directory with a content hash of
+            // the library: two jars in the mods folder must never fight over one
+            // file, and a System.load of the SAME path already loaded earlier in
+            // this JVM process would silently return the OLD library (Windows
+            // reuses the module by path) — the actual cause of "missing native
+            // symbol" errors after a jolt-jni upgrade.
+            NativeLibraryInstaller.install(NATIVE_DIR, fileName, bytes, path -> System.load(path));
 
             JoltPhysicsObject.startCleaner();
             Jolt.registerDefaultAllocator();
@@ -136,25 +125,6 @@ public final class JoltNative {
     public static void ensureInitialized() {
         if (!tryInitialize()) {
             throw new IllegalStateException("Jolt Physics natives are not available on this system");
-        }
-    }
-
-    /**
-     * First 8 uppercase hex chars of the SHA-256 of a byte array.
-     */
-    private static final class ShortHash {
-        static String of(final byte[] bytes) {
-            final MessageDigest digest;
-            try {
-                digest = MessageDigest.getInstance("SHA-256");
-            } catch (final NoSuchAlgorithmException e) {
-                throw new IllegalStateException(e);
-            }
-            final StringBuilder hex = new StringBuilder();
-            for (final byte b : digest.digest(bytes)) {
-                hex.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
-            }
-            return hex.substring(0, 8).toUpperCase(Locale.ROOT);
         }
     }
 }

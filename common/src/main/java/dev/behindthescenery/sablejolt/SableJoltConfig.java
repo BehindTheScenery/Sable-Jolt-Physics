@@ -60,6 +60,18 @@ public final class SableJoltConfig {
         this.physicsThreads = parseInt(props.getProperty("physics_threads"), 0, 0, 256);
     }
 
+    /**
+     * Size of each shared worker pool: the configured value, or one per spare core
+     * up to 8 (the solver gains little beyond that, and the threads of a pool take
+     * memory and wake-up time on a machine shared with other work).
+     */
+    public int workerThreads() {
+        if (this.physicsThreads > 0) {
+            return this.physicsThreads;
+        }
+        return Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors() - 1));
+    }
+
     public static SableJoltConfig get() {
         SableJoltConfig config = instance;
         if (config == null) {
@@ -133,14 +145,15 @@ public final class SableJoltConfig {
                 # Recommended for worlds with builds made before this addon was installed.
                 rapier_compatible_physics=%s
 
-                # Capacity of the physics world of each dimension. Terrain near sub-levels uses one body per
-                # 16x16x16 section. The log warns when a limit is reached; raise the reported value then.
-                # Higher values use more memory per dimension.
+                # Capacity of the physics world of each dimension (terrain takes one body per 1024x1024 area).
+                # The log warns when a limit is reached; raise the reported value then.
+                # Higher values use more memory per dimension that has a physics world; a dimension gets
+                # one when its first sub-level appears.
                 max_bodies=%d
                 max_body_pairs=%d
                 max_contact_constraints=%d
 
-                # Native physics worker threads shared by all dimensions (0 = automatic).
+                # Physics worker threads shared by all dimensions (0 = one per spare core, at most 8).
                 physics_threads=%d
                 """.formatted(
                 this.backend.name().toLowerCase(Locale.ROOT),

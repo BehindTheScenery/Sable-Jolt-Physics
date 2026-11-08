@@ -26,7 +26,39 @@ tasks.named('jmhJar') {
     zip64 = true
 }
 
+// Headless Rapier vs Jolt behaviour comparison (Sable's own Rapier natives next to the Jolt scene).
+//   gradle :common:parity                          all scenarios
+//   gradle :common:parity -PparityScenario=slide   scenarios whose name contains "slide"
+// Trajectories are written to build/parity-run/parity-results/<scenario>.csv.
+tasks.register('parity', JavaExec) {
+    group = 'verification'
+    description = 'Runs the same voxel scenes through Rapier and Jolt and compares their behaviour.'
+    dependsOn 'jmhClasses'
+    classpath = sourceSets.jmh.runtimeClasspath
+    mainClass = (String) (project.findProperty('parityMain') ?: 'dev.behindthescenery.sablejolt.ParityHarness')
+    def runDir = layout.buildDirectory.dir('parity-run').get().asFile
+    workingDir = runDir
+    jvmArgs = ['-Xmx2g', "-Dbench.gamedir=${runDir}"]
+    if (project.hasProperty('parityScenario')) {
+        args((String) project.property('parityScenario'))
+    }
+    if (project.hasProperty('parityArgs')) {
+        args(((String) project.property('parityArgs')).split(' ').toList())
+    }
+    doFirst { runDir.mkdirs() }
+}
+
+test {
+    useJUnitPlatform()
+    // Minecraft's logging config on the class path writes a logs/ folder into the working directory.
+    workingDir = layout.buildDirectory.dir('test-run').get().asFile
+    doFirst { workingDir.mkdirs() }
+}
+
 dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
     // We depend on Fabric Loader here to use the Fabric @Environment annotations,
     // which get remapped to the correct annotations on each platform.
     // Do NOT use other classes from Fabric Loader.

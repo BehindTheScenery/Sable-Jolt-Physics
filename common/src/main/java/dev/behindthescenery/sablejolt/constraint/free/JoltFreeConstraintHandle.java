@@ -51,6 +51,13 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
     private ServerSubLevel subLevel;
 
     public static JoltFreeConstraintHandle create(final JoltPhysicsScene scene, @Nullable final PhysicsPipelineBody bodyA, @Nullable final PhysicsPipelineBody bodyB, final FreeConstraintConfiguration config, final boolean renderFrameServo) {
+        // The servo drives body 2. Ropes and plungers may pass the static world as
+        // body B, and the ground body has no motion properties: its addForce is a
+        // null read in native code, which takes the JVM down. Keep the world on side 1.
+        if (bodyB == null && bodyA != null) {
+            return create(scene, null, bodyA, new FreeConstraintConfiguration(config.pos2(), config.pos1(), config.orientation()), renderFrameServo);
+        }
+
         final JoltPhysicsScene.SableBody sbA = bodyA == null ? null : scene.body(bodyA.getRuntimeId());
         final JoltPhysicsScene.SableBody sbB = bodyB == null ? null : scene.body(bodyB.getRuntimeId());
         if ((sbA == null && sbB == null) || !scene.canConstrain(bodyA, sbA) || !scene.canConstrain(bodyB, sbB)) {
@@ -62,35 +69,25 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
 
         final SixDofConstraintSettings settings = new SixDofConstraintSettings();
         settings.setSpace(EConstraintSpace.LocalToBodyCom);
-        // Velocity motors measure their own error externally (in double precision),
-        // so the raw anchor positions only matter for the joint frame orientation,
-        // not for the servo: keep them small to stay away from float precision loss.
-        settings.setPosition1(RVec3.sZero());
 
-        // Sable's contract: pos2 arrives in the plot-global frame while the Jolt
-        // scene (and this body) live in the render frame next to the player.
-        // Project it with the sub-level's logical pose (the same transform Sable's
-        // projectOutOfSubLevel applies), then express it relative to the LIVE body
-        // center of mass so the linear servo force produces realistic torque
-        // around the grabbed block.
-        final ServerSubLevel ssl = bodyB instanceof final ServerSubLevel s ? s
-                : bodyA instanceof final ServerSubLevel s2 ? s2 : null;
+        // Sable's contract: each anchor arrives in the block space of its own body
+        // (the plot of a sub-level, world coordinates for the static world) while
+        // the Jolt scene lives in the render frame next to the player. Project each
+        // one with its own sub-level's logical pose (the same transform Sable's
+        // projectOutOfSubLevel applies), then express it relative to the LIVE center
+        // of mass so forces at the anchor produce realistic torque. All axes are
+        // free, so Jolt itself never pulls on these anchors; keep them small to stay
+        // away from float precision loss.
+        final ServerSubLevel ssl = bodyB instanceof final ServerSubLevel s ? s : null;
+        final org.joml.Vector3dc p1World = bodyA instanceof final ServerSubLevel sa
+                ? sa.logicalPose().transformPosition(config.pos1(), new org.joml.Vector3d())
+                : config.pos1();
         final org.joml.Vector3dc p2World = ssl != null
                 ? ssl.logicalPose().transformPosition(config.pos2(), new org.joml.Vector3d())
                 : config.pos2();
-        double p2x = p2World.x();
-        double p2y = p2World.y();
-        double p2z = p2World.z();
-        if (sbB != null) {
-            final RVec3 com = sbB.body.getCenterOfMassPosition();
-            final Quat inv = sbB.body.getRotation().conjugated();
-            final Vec3 off = JoltFixedConstraintHandle.rotate(inv.getX(), inv.getY(), inv.getZ(), inv.getW(),
-                    (float) (p2x - com.xx()), (float) (p2y - com.yy()), (float) (p2z - com.zz()));
-            p2x = off.getX();
-            p2y = off.getY();
-            p2z = off.getZ();
-        }
-        settings.setPosition2(new RVec3((float) p2x, (float) p2y, (float) p2z));
+        settings.setPosition1(sbA != null ? comRelative(sbA, p1World) : RVec3.sZero());
+        settings.setPosition2(sbB != null ? comRelative(sbB, p2World)
+                : new RVec3((float) p2World.x(), (float) p2World.y(), (float) p2World.z()));
 
         final var q = config.orientation();
         // NOTE: do NOT compose this with the sub-level's live orientation —
@@ -130,10 +127,18 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         handle.frameQuat.set(frameQ);
         handle.renderFrameServo = renderFrameServo;
         if (!renderFrameServo) {
-            handle.targetWorld.set(config.pos1().x(), config.pos1().y(), config.pos1().z());
+            handle.targetWorld.set(p1World.x(), p1World.y(), p1World.z());
         }
         handle.subLevel = ssl;
         return handle;
+    }
+
+    private static RVec3 comRelative(final JoltPhysicsScene.SableBody sb, final org.joml.Vector3dc world) {
+        final RVec3 com = sb.body.getCenterOfMassPosition();
+        final Quat inv = sb.body.getRotation().conjugated();
+        final Vec3 off = JoltFixedConstraintHandle.rotate(inv.getX(), inv.getY(), inv.getZ(), inv.getW(),
+                (float) (world.x() - com.xx()), (float) (world.y() - com.yy()), (float) (world.z() - com.zz()));
+        return new RVec3(off.getX(), off.getY(), off.getZ());
     }
 
     private JoltFreeConstraintHandle(final JoltPhysicsScene scene, final long handle) {
@@ -151,7 +156,8 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
         JoltPhysicsScene.JointRecord record = null;
         try {
             record = this.record();
-            if (record != null && record.constraint instanceof final SixDofConstraint constraint) {
+            // A rope or plunger letting go must not stop the ship's rotation.
+            if (record != null && !record.damper && record.constraint instanceof final SixDofConstraint constraint) {
                 final Body body = constraint.getBody2();
                 if (body != null && body.isDynamic()) {
                     // Fully stop the residual spin: the servo re-drives omega within
@@ -182,6 +188,15 @@ public class JoltFreeConstraintHandle extends JoltConstraintHandle implements Fr
     protected void setMotorImpl(final int axisOrdinal, final double target, final double stiffness, final double damping, final boolean hasForceLimit, final double maxForce) {
         final JoltPhysicsScene.JointRecord record = this.record();
         if (record == null || !(record.constraint instanceof final SixDofConstraint constraint)) {
+            return;
+        }
+
+        // No spring and no force limit: plain drag between the anchors, set once and
+        // active for the constraint's whole life (ropes, plunger launcher). Not the
+        // creative grip: that one would switch the ship's gravity off and snap its
+        // orientation. Measured on Rapier: dv/dt = -damping * v, independent of mass.
+        if (!hasForceLimit && stiffness == 0.0) {
+            this.scene.setJointDamping(record, axisOrdinal < 3, damping);
             return;
         }
 
